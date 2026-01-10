@@ -1,0 +1,30 @@
+// custom_instrument.rt - Example with custom instrument definition
+tempo 140
+time 4/4
+key A minor
+
+// Define a custom bass synthesizer
+instrument bass {
+    generator: saw(1.0) + square(0.3, harmonic(2))
+    envelope: adsr(0.01, 0.2, 0.6, 0.1)
+    effects: [lowpass(800, 0.5)]
+}
+
+// Define a simple kick drum
+instrument kick {
+    generator: sine(1.0, freq(58)) + noise(0.2)
+    envelope: adsr(0.001, 0.1, 0.0, 0.0)
+    pitch_envelope: bezier(1.4, 0.1, 0.3)
+}
+
+// Bass line using the custom instrument
+voice bassline: bass {
+    | a2 4 a2 4 e2 4 a2 4 |
+    | f2 4 f2 4 e2 4 r 4 |
+}
+
+// Drum pattern
+voice drums: kick {
+    | c2 4 r 8 c2 8 r 4 c2 4 |
+    | c2 4 r 4 c2 8 c2 8 c2 4 |
+}
