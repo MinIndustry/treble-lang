@@ -4,25 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Parser
 nom = "8.0"
-
-# Core synthesis (local workspace)
-rustic = { path = "../rustic" }
-
-# Utilities
-thiserror = "2.0"
-log = "0.4"
-
-# CLI
-clap = { version = "4.0", features = ["derive"] }
-
-# REPL
-rustyline = "13.0"
-
-# Serialization (for future features)
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
 
 [dev-dependencies]
 pretty_assertions = "1.4"

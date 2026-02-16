@@ -1,7 +1,11 @@
-//! Abstract Syntax Tree definitions
+//! Abstract Syntax Tree for Rustic Live DSL.
+//!
+//! This module defines the IR produced by the parser and consumed by the
+//! Session evaluator.  It closely mirrors the language grammar from
+//! LANGUAGE.md.
 
-pub mod score;
-pub mod shared;
+pub mod mini;
+pub mod program;
 
-pub use score::*;
-pub use shared::*;
+pub use mini::*;
+pub use program::*;
