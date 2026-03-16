@@ -27,7 +27,11 @@ pub struct SourceLocation {
 
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:?} at {}:{}: {}", self.kind, self.location.line, self.location.column, self.message)
+        write!(
+            f,
+            "{:?} at {}:{}: {}",
+            self.kind, self.location.line, self.location.column, self.message
+        )
     }
 }
 

@@ -205,7 +205,12 @@ mod tests {
         session.evaluate("kick kick \"x ~ x ~\"\nbass sine \"c2 eb2\"");
 
         let result = session.evaluate("kick kick \"x ~ x ~\"");
-        assert!(result.deltas.iter().any(|d| *d == Delta::Remove("bass".into())));
+        assert!(
+            result
+                .deltas
+                .iter()
+                .any(|d| *d == Delta::Remove("bass".into()))
+        );
     }
 
     #[test]
@@ -214,7 +219,12 @@ mod tests {
         session.evaluate("kick kick \"x ~ x ~\"");
 
         let result = session.evaluate("kick kick \"x x x x\"");
-        assert!(result.deltas.iter().any(|d| *d == Delta::Modify("kick".into())));
+        assert!(
+            result
+                .deltas
+                .iter()
+                .any(|d| *d == Delta::Modify("kick".into()))
+        );
     }
 
     #[test]
@@ -223,7 +233,12 @@ mod tests {
         session.evaluate("kick kick \"x ~ x ~\"");
 
         let result = session.evaluate("; kick kick \"x ~ x ~\"");
-        assert!(result.deltas.iter().any(|d| *d == Delta::Mute("kick".into())));
+        assert!(
+            result
+                .deltas
+                .iter()
+                .any(|d| *d == Delta::Mute("kick".into()))
+        );
         assert_eq!(result.patterns_muted, 1);
         assert_eq!(result.patterns_active, 0);
     }
@@ -234,7 +249,12 @@ mod tests {
         session.evaluate("; kick kick \"x ~ x ~\"");
 
         let result = session.evaluate("kick kick \"x ~ x ~\"");
-        assert!(result.deltas.iter().any(|d| *d == Delta::Unmute("kick".into())));
+        assert!(
+            result
+                .deltas
+                .iter()
+                .any(|d| *d == Delta::Unmute("kick".into()))
+        );
     }
 
     #[test]
