@@ -2,8 +2,8 @@
 //!
 //! Each source line is parsed independently into a [`SourceLine`].
 
-use crate::ast::program::*;
 use super::mini::parse_mini;
+use crate::ast::program::*;
 
 /// Parse a single source line into a [`SourceLine`].
 pub fn parse_line(line: &str) -> Result<SourceLine, String> {
@@ -34,8 +34,7 @@ pub fn parse_line(line: &str) -> Result<SourceLine, String> {
     }
 
     // Muted pattern
-    if trimmed.starts_with(';') {
-        let rest = trimmed[1..].trim_start();
+    if let Some(rest) = trimmed.strip_prefix(';') {
         return parse_pattern_line(rest, true);
     }
 
@@ -45,13 +44,10 @@ pub fn parse_line(line: &str) -> Result<SourceLine, String> {
 
 /// Strip a keyword prefix followed by whitespace. Returns the rest.
 fn strip_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
-    if input.starts_with(keyword) {
-        let rest = &input[keyword.len()..];
-        if rest.starts_with(char::is_whitespace) {
-            Some(rest.trim_start())
-        } else {
-            None
-        }
+    if let Some(rest) = input.strip_prefix(keyword)
+        && rest.starts_with(char::is_whitespace)
+    {
+        Some(rest.trim_start())
     } else {
         None
     }
@@ -73,7 +69,10 @@ fn parse_bpm(rest: &str) -> Result<SourceLine, String> {
 fn parse_sig(rest: &str) -> Result<SourceLine, String> {
     let parts: Vec<&str> = rest.trim().split('/').collect();
     if parts.len() != 2 {
-        return Err(format!("expected time signature N/D, got '{}'", rest.trim()));
+        return Err(format!(
+            "expected time signature N/D, got '{}'",
+            rest.trim()
+        ));
     }
     let num: u8 = parts[0]
         .trim()
@@ -96,7 +95,7 @@ fn parse_sig(rest: &str) -> Result<SourceLine, String> {
 }
 
 fn parse_scale(rest: &str) -> Result<SourceLine, String> {
-    let mut tokens = rest.trim().split_whitespace();
+    let mut tokens = rest.split_whitespace();
     let root_str = tokens
         .next()
         .ok_or_else(|| "expected scale root note".to_string())?;
@@ -285,10 +284,7 @@ fn parse_single_transform(input: &str) -> Result<Transform, String> {
     }
 }
 
-fn parse_transform_f64(
-    parts: &mut std::str::SplitWhitespace,
-    name: &str,
-) -> Result<f64, String> {
+fn parse_transform_f64(parts: &mut std::str::SplitWhitespace, name: &str) -> Result<f64, String> {
     let val_str = parts
         .next()
         .ok_or_else(|| format!("{}: expected number", name))?;
@@ -321,7 +317,10 @@ fn parse_pitch_root(s: &str) -> Result<PitchRoot, String> {
         "" => Accidental::Natural,
         other => return Err(format!("invalid accidental: '{}'", other)),
     };
-    Ok(PitchRoot { name: letter, accidental })
+    Ok(PitchRoot {
+        name: letter,
+        accidental,
+    })
 }
 
 fn parse_scale_mode(s: &str) -> Result<ScaleMode, String> {
@@ -405,10 +404,7 @@ mod tests {
     #[test]
     fn test_comment() {
         let result = parse_line("-- hello world").unwrap();
-        assert_eq!(
-            result,
-            SourceLine::Comment("-- hello world".to_string())
-        );
+        assert_eq!(result, SourceLine::Comment("-- hello world".to_string()));
     }
 
     // ---- Directives ----
@@ -511,8 +507,7 @@ mod tests {
 
     #[test]
     fn test_pattern_with_transforms() {
-        let result =
-            parse_line("lead saw \"c4 eb4 g4 bb4\" | rev | slow 2").unwrap();
+        let result = parse_line("lead saw \"c4 eb4 g4 bb4\" | rev | slow 2").unwrap();
         if let SourceLine::Pattern(p) = result {
             assert_eq!(p.name, "lead");
             assert_eq!(p.transforms.len(), 2);
@@ -525,8 +520,7 @@ mod tests {
 
     #[test]
     fn test_pattern_with_every_transform() {
-        let result =
-            parse_line("hats hihat \"x*8\" | every 4 rev").unwrap();
+        let result = parse_line("hats hihat \"x*8\" | every 4 rev").unwrap();
         if let SourceLine::Pattern(p) = result {
             assert_eq!(
                 p.transforms[0],
@@ -539,8 +533,7 @@ mod tests {
 
     #[test]
     fn test_pattern_with_arp() {
-        let result =
-            parse_line("arp piano \"[c3,e3,g3]\" | arp up").unwrap();
+        let result = parse_line("arp piano \"[c3,e3,g3]\" | arp up").unwrap();
         if let SourceLine::Pattern(p) = result {
             assert_eq!(p.transforms[0], Transform::Arp(ArpMode::Up));
         } else {
@@ -550,8 +543,7 @@ mod tests {
 
     #[test]
     fn test_pattern_with_scale_transform() {
-        let result =
-            parse_line("mel saw \"0 2 4 6\" | scale C minor").unwrap();
+        let result = parse_line("mel saw \"0 2 4 6\" | scale C minor").unwrap();
         if let SourceLine::Pattern(p) = result {
             if let Transform::Scale(root, mode) = &p.transforms[0] {
                 assert_eq!(root.name, NoteLetter::C);
@@ -566,9 +558,10 @@ mod tests {
 
     #[test]
     fn test_pattern_with_effects() {
-        let result =
-            parse_line("pad pad \"[c3,eb3,g3]\" | gain 0.5 | lpf 800 | delay 0.25 0.4 | reverb 0.3")
-                .unwrap();
+        let result = parse_line(
+            "pad pad \"[c3,eb3,g3]\" | gain 0.5 | lpf 800 | delay 0.25 0.4 | reverb 0.3",
+        )
+        .unwrap();
         if let SourceLine::Pattern(p) = result {
             assert_eq!(p.transforms.len(), 4);
             assert_eq!(p.transforms[0], Transform::Gain(0.5));

@@ -107,11 +107,10 @@ fn parse_accidental(input: &str, letter: NoteLetter) -> IResult<&str, Accidental
             return Ok((rest, Accidental::Sharp));
         }
         // 'b' followed by digit = flat
-        if input.starts_with('b') {
-            let after_b = &input[1..];
-            if after_b.starts_with(|c: char| c.is_ascii_digit()) {
-                return Ok((after_b, Accidental::Flat));
-            }
+        if let Some(after_b) = input.strip_prefix('b')
+            && after_b.starts_with(|c: char| c.is_ascii_digit())
+        {
+            return Ok((after_b, Accidental::Flat));
         }
         Ok((input, Accidental::Natural))
     } else {

@@ -57,19 +57,14 @@ pub enum NoteLetter {
 }
 
 /// Accidental applied to a pitch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Accidental {
+    #[default]
     Natural,
     Sharp,
     DoubleSharp,
     Flat,
     DoubleFlat,
-}
-
-impl Default for Accidental {
-    fn default() -> Self {
-        Accidental::Natural
-    }
 }
 
 /// Musical scale / mode.
