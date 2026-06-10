@@ -1,8 +1,8 @@
-# Rustic Live — Language Specification v0.1
+# Treble Live — Language Specification v0.1
 
 ## Overview
 
-Rustic Live is a live-coding music DSL designed for real-time composition in a
+Treble Live is a live-coding music DSL designed for real-time composition in a
 terminal environment. It prioritises brevity and immediacy: every line either
 configures the session or defines a looping pattern. Changes take effect at the
 next loop boundary (quantised to the time signature).
@@ -14,7 +14,7 @@ self-contained (no host language required).
 
 ## 1. Source Structure
 
-A Rustic Live source file (`.rt`) is a sequence of **lines**. Each line is one
+A Treble Live source file (`.rt`) is a sequence of **lines**. Each line is one
 of:
 
 | Line kind        | Syntax                                    |

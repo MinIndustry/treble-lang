@@ -1,4 +1,4 @@
-//! Parser for Rustic Live DSL.
+//! Parser for Treble Live DSL.
 //!
 //! The parser is line-oriented: each source line is parsed independently.
 //! Mini-notation (inside double quotes) is parsed with nom combinators.

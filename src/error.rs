@@ -1,4 +1,4 @@
-//! Error types for rustic-lang
+//! Error types for treble-lang
 
 use std::path::PathBuf;
 

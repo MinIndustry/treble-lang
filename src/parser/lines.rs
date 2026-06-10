@@ -1,4 +1,4 @@
-//! Line-level parser for Rustic Live DSL.
+//! Line-level parser for Treble Live DSL.
 //!
 //! Each source line is parsed independently into a [`SourceLine`].
 

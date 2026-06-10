@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{PatternDef, Program, SourceLine};
+use crate::ast::{PatternDef, PitchRoot, Program, ScaleMode, SourceLine};
 use crate::error::CompileError;
 use crate::parser::parse_program;
 
@@ -44,6 +44,8 @@ pub struct Session {
     pub bpm: u32,
     /// Current time signature (numerator, denominator).
     pub sig: (u8, u8),
+    /// Default scale for degree patterns (`scale` directive).
+    pub scale: Option<(PitchRoot, ScaleMode)>,
     /// Active patterns by name.
     patterns: HashMap<String, PatternDef>,
     /// Pending deltas (queued for next loop boundary).
@@ -57,6 +59,7 @@ impl Session {
         Self {
             bpm: 120,
             sig: (4, 4),
+            scale: None,
             patterns: HashMap::new(),
             pending: Vec::new(),
             last_program: None,
@@ -71,12 +74,14 @@ impl Session {
         // Extract state from the new program
         let mut new_bpm = self.bpm;
         let mut new_sig = self.sig;
+        let mut new_scale = self.scale;
         let mut new_patterns: HashMap<String, PatternDef> = HashMap::new();
 
         for line in &program.lines {
             match line {
                 SourceLine::Bpm(val) => new_bpm = *val,
                 SourceLine::Sig(num, den) => new_sig = (*num, *den),
+                SourceLine::Scale(root, mode) => new_scale = Some((*root, *mode)),
                 SourceLine::Pattern(def) => {
                     new_patterns.insert(def.name.clone(), def.clone());
                 }
@@ -90,6 +95,7 @@ impl Session {
         // Apply immediate directives
         self.bpm = new_bpm;
         self.sig = new_sig;
+        self.scale = new_scale;
 
         // Update pattern state
         self.pending = deltas.clone();
@@ -171,6 +177,7 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Accidental, NoteLetter, PitchRoot, ScaleMode};
 
     #[test]
     fn test_session_initial_state() {
@@ -273,6 +280,23 @@ mod tests {
         assert_eq!(result.errors.len(), 1);
         assert_eq!(session.bpm, 140);
         assert_eq!(result.patterns_active, 1);
+    }
+
+    #[test]
+    fn test_evaluate_scale_directive() {
+        let mut session = Session::new();
+        let result = session.evaluate("scale C minor\nkick kick \"x ~ x ~\"");
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            session.scale,
+            Some((
+                PitchRoot {
+                    name: NoteLetter::C,
+                    accidental: Accidental::Natural,
+                },
+                ScaleMode::Minor,
+            ))
+        );
     }
 
     #[test]

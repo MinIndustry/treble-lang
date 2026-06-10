@@ -1,4 +1,4 @@
-//! Abstract Syntax Tree for Rustic Live DSL.
+//! Abstract Syntax Tree for Treble Live DSL.
 //!
 //! This module defines the IR produced by the parser and consumed by the
 //! Session evaluator.  It closely mirrors the language grammar from
