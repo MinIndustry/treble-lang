@@ -19,6 +19,8 @@ pub enum SourceLine {
     Scale(PitchRoot, ScaleMode),
     /// `load "<path>"`
     Load(String),
+    /// `include <instrument>` — explicitly make a registry instrument available.
+    Include(String),
     /// A pattern line (possibly muted).
     Pattern(PatternDef),
     /// A comment (kept for round-tripping, not evaluated).
