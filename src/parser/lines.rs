@@ -32,6 +32,14 @@ pub fn parse_line(line: &str) -> Result<SourceLine, String> {
     if let Some(rest) = strip_keyword(trimmed, "load") {
         return parse_load(rest);
     }
+    if let Some(rest) = strip_keyword(trimmed, "include") {
+        return parse_include(rest);
+    }
+    // Early builds used `use`; keep it as a parse-compatible alias while all
+    // diagnostics and documentation point to the clearer `include` spelling.
+    if let Some(rest) = strip_keyword(trimmed, "use") {
+        return parse_include(rest);
+    }
 
     // Muted pattern
     if let Some(rest) = trimmed.strip_prefix(';') {
@@ -85,11 +93,8 @@ fn parse_sig(rest: &str) -> Result<SourceLine, String> {
     if num == 0 {
         return Err("time signature numerator must be > 0".to_string());
     }
-    if !den.is_power_of_two() || den == 0 {
-        return Err(format!(
-            "time signature denominator must be a power of 2, got {}",
-            den
-        ));
+    if den == 0 {
+        return Err("time signature denominator must be > 0".to_string());
     }
     Ok(SourceLine::Sig(num, den))
 }
@@ -119,6 +124,12 @@ fn parse_load(rest: &str) -> Result<SourceLine, String> {
             trimmed
         ))
     }
+}
+
+fn parse_include(rest: &str) -> Result<SourceLine, String> {
+    let name = rest.trim();
+    validate_identifier(name)?;
+    Ok(SourceLine::Include(name.to_string()))
 }
 
 // --- Pattern line parser ---
@@ -431,9 +442,27 @@ mod tests {
 
     #[test]
     fn test_sig_invalid() {
-        assert!(parse_line("sig 4/3").is_err()); // 3 not power of 2
         assert!(parse_line("sig 0/4").is_err()); // numerator 0
+        assert!(parse_line("sig 4/0").is_err()); // denominator 0
         assert!(parse_line("sig abc").is_err());
+    }
+
+    #[test]
+    fn test_sig_accepts_non_binary_denominator() {
+        assert_eq!(parse_line("sig 4/3").unwrap(), SourceLine::Sig(4, 3));
+        assert_eq!(parse_line("sig 5/6").unwrap(), SourceLine::Sig(5, 6));
+    }
+
+    #[test]
+    fn test_explicit_instrument_include() {
+        assert_eq!(
+            parse_line("include hihat").unwrap(),
+            SourceLine::Include("hihat".into())
+        );
+        assert_eq!(
+            parse_line("use hihat").unwrap(),
+            SourceLine::Include("hihat".into())
+        );
     }
 
     #[test]

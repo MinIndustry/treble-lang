@@ -39,6 +39,7 @@ pub struct EvalResult {
 }
 
 /// Live session state.
+#[derive(Clone)]
 pub struct Session {
     /// Current BPM.
     pub bpm: u32,
@@ -70,6 +71,17 @@ impl Session {
     /// and return the result.
     pub fn evaluate(&mut self, source: &str) -> EvalResult {
         let (program, errors) = parse_program(source);
+
+        // Evaluation is transactional: a partially parsed buffer must never
+        // poison the state used to diff the next stage-safe edit.
+        if !errors.is_empty() {
+            return EvalResult {
+                errors,
+                deltas: Vec::new(),
+                patterns_active: self.patterns.values().filter(|p| !p.muted).count(),
+                patterns_muted: self.patterns.values().filter(|p| p.muted).count(),
+            };
+        }
 
         // Extract state from the new program
         let mut new_bpm = self.bpm;
@@ -276,10 +288,13 @@ mod tests {
     #[test]
     fn test_error_recovery_preserves_valid() {
         let mut session = Session::new();
-        let result = session.evaluate("bpm 140\nthis is broken ???\nkick kick \"x ~ x ~\"");
+        session.evaluate("bpm 130\nkick kick \"x ~ x ~\"");
+        let result = session.evaluate("bpm 140\nthis is broken ???\nsnare snare \"x ~ x ~\"");
         assert_eq!(result.errors.len(), 1);
-        assert_eq!(session.bpm, 140);
+        assert_eq!(session.bpm, 130);
         assert_eq!(result.patterns_active, 1);
+        assert!(session.all_patterns().contains_key("kick"));
+        assert!(!session.all_patterns().contains_key("snare"));
     }
 
     #[test]
