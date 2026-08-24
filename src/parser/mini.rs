@@ -31,14 +31,26 @@ pub fn parse_mini(input: &str) -> Result<MiniNotation, String> {
             Ok(notation)
         }
         Ok((rest, _)) => Err(format!("unexpected trailing input: '{}'", rest)),
-        // `parse_group` is the only place that raises a non-recoverable
-        // failure, so this maps back to exactly one authoring mistake.
-        Err(nom::Err::Failure(_)) => {
-            Err("a group uses ',' for a chord or '|' for a random choice, not both".to_string())
-        }
+        // A non-recoverable failure is always a real authoring mistake rather
+        // than a wrong turn in `alt`. nom's error carries only an `ErrorKind`,
+        // so the few of them are told apart by which kind they raise.
+        Err(nom::Err::Failure(error)) => Err(match error.code {
+            FAIL_DOUBLE_VELOCITY => "a step takes one velocity, not two".to_string(),
+            FAIL_ACCENT_VELOCITY => {
+                "'X' is already a velocity of 1.0; write 'x:v' to choose one".to_string()
+            }
+            _ => "a group uses ',' for a chord or '|' for a random choice, not both".to_string(),
+        }),
         Err(e) => Err(format!("mini-notation parse error: {}", e)),
     }
 }
+
+/// Raised by [`parse_group`] when a group mixes `,` and `|`.
+const FAIL_MIXED_SEPARATORS: nom::error::ErrorKind = nom::error::ErrorKind::Verify;
+/// Raised by [`parse_step`] when one step carries two `:v` suffixes.
+const FAIL_DOUBLE_VELOCITY: nom::error::ErrorKind = nom::error::ErrorKind::Many1;
+/// Raised by [`parse_step`] for `X:v`, which asks for two velocities at once.
+const FAIL_ACCENT_VELOCITY: nom::error::ErrorKind = nom::error::ErrorKind::ManyMN;
 
 /// Check the invariants the grammar itself cannot express.
 ///
@@ -49,13 +61,17 @@ fn validate_sequence(sequence: &Sequence) -> Result<(), String> {
         for modifier in step.modifiers.iter() {
             validate_modifier(modifier)?;
         }
+        validate_velocity(step)?;
         match &step.atom {
             Atom::Group(group) => {
                 for layer in group.layers.iter() {
                     // A chord layer is a fixed set of notes; a generated walk
                     // has no single note to contribute to one.
                     if group.mode == GroupMode::Chord
-                        && layer.steps.iter().any(|step| matches!(step.atom, Atom::Solo(_)))
+                        && layer
+                            .steps
+                            .iter()
+                            .any(|step| matches!(step.atom, Atom::Solo(_)))
                     {
                         return Err(
                             "solo(..) can't be a chord layer; put it in its own step".to_string()
@@ -82,10 +98,43 @@ fn validate_sequence(sequence: &Sequence) -> Result<(), String> {
     Ok(())
 }
 
+/// `:v` (and the `X` it desugars from) must be a playable strike, on something
+/// that actually strikes.
+fn validate_velocity(step: &Step) -> Result<(), String> {
+    let Some(velocity) = &step.velocity else {
+        return Ok(());
+    };
+    match step.atom {
+        // Silence has no strike, and a hold sustains whatever it extends, so
+        // neither has a velocity of its own to set. Ignoring the suffix would
+        // hide the misunderstanding instead of correcting it.
+        Atom::Rest => {
+            return Err(
+                "a rest can't carry a velocity: '~' is silence, so ':v' has nothing to strike"
+                    .to_string(),
+            );
+        }
+        Atom::Hold => {
+            return Err("a hold can't carry a velocity: '_' sustains the event before it, which was already struck".to_string());
+        }
+        _ => {}
+    }
+    for value in velocity.values() {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(format!(
+                "velocity {value} is outside the supported range 0.0-1.0"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_modifier(modifier: &Modifier) -> Result<(), String> {
     let positive = |value: u32, sigil: &str| {
         if value == 0 {
-            Err(format!("'{sigil}0' is not a count; use at least '{sigil}1'"))
+            Err(format!(
+                "'{sigil}0' is not a count; use at least '{sigil}1'"
+            ))
         } else {
             Ok(())
         }
@@ -134,10 +183,76 @@ fn parse_sequence(input: &str) -> IResult<&str, Sequence> {
 // --- Step = Atom { Modifier } ---
 
 fn parse_step(input: &str) -> IResult<&str, Step> {
-    let (input, atom) = parse_atom(input)?;
-    // Every modifier consumes at least its sigil, so `many0` always advances.
-    let (input, modifiers) = many0(parse_modifier).parse(input)?;
-    Ok((input, Step { atom, modifiers }))
+    // `X` is stored as `x:1.0` rather than as an atom of its own, so a consumer
+    // only has to implement velocity once.
+    let (mut input, accented) = match parse_accent(input) {
+        Ok((rest, ())) => (rest, true),
+        Err(_) => (input, false),
+    };
+    let (rest, atom) = if accented {
+        (input, Atom::Trigger)
+    } else {
+        parse_atom(input)?
+    };
+    input = rest;
+    let mut modifiers = Vec::new();
+    let mut velocity = accented.then(|| Ramp::fixed(1.0));
+    // Modifiers and the velocity suffix may be written in either order, and a
+    // velocity means the same thing wherever it sits (see [`Step`]), so both
+    // are taken in one pass. Every one of them consumes at least its sigil, so
+    // the loop always advances.
+    loop {
+        if let Ok((rest, next)) = parse_velocity(input) {
+            if velocity.is_some() {
+                let code = if accented {
+                    FAIL_ACCENT_VELOCITY
+                } else {
+                    FAIL_DOUBLE_VELOCITY
+                };
+                return Err(nom::Err::Failure(nom::error::Error::new(input, code)));
+            }
+            velocity = Some(next);
+            input = rest;
+            continue;
+        }
+        match parse_modifier(input) {
+            Ok((rest, modifier)) => {
+                modifiers.push(modifier);
+                input = rest;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok((
+        input,
+        Step {
+            atom,
+            modifiers,
+            velocity,
+        },
+    ))
+}
+
+/// `X` — an accented trigger. Unambiguous because note letters are `a`–`g`.
+fn parse_accent(input: &str) -> IResult<&str, ()> {
+    let (input, _) = char('X').parse(input)?;
+    if input
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_alphanumeric())
+        .unwrap_or(false)
+    {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Char,
+        )));
+    }
+    Ok((input, ()))
+}
+
+/// `:0.6`, `:0.3..0.9` — an explicit velocity for this step.
+fn parse_velocity(input: &str) -> IResult<&str, Ramp<f64>> {
+    preceded(char(':'), parse_ramp_f64).parse(input)
 }
 
 // --- Atom ---
@@ -290,9 +405,9 @@ fn parse_solo(input: &str) -> IResult<&str, Atom> {
 fn parse_i32(input: &str) -> IResult<&str, i32> {
     let (rest, negative) = opt(char('-')).parse(input)?;
     let (rest, digits) = digit1(rest)?;
-    let value: i32 = digits.parse().map_err(|_| {
-        nom::Err::Error(nom::error::Error::new(rest, nom::error::ErrorKind::Digit))
-    })?;
+    let value: i32 = digits
+        .parse()
+        .map_err(|_| nom::Err::Error(nom::error::Error::new(rest, nom::error::ErrorKind::Digit)))?;
     Ok((rest, if negative.is_some() { -value } else { value }))
 }
 
@@ -322,7 +437,7 @@ fn parse_group(input: &str) -> IResult<&str, Atom> {
         // as some other atom, and `parse_mini` turns it into a real message.
         return Err(nom::Err::Failure(nom::error::Error::new(
             input,
-            nom::error::ErrorKind::Verify,
+            FAIL_MIXED_SEPARATORS,
         )));
     }
     let mode = match (chord, random) {
@@ -431,10 +546,9 @@ fn parse_ramp_f64(input: &str) -> IResult<&str, Ramp<f64>> {
 }
 
 fn parse_f64(input: &str) -> IResult<&str, f64> {
-    map_res(
-        recognize((digit1, opt((char('.'), digit1)))),
-        |s: &str| s.parse::<f64>(),
-    )
+    map_res(recognize((digit1, opt((char('.'), digit1)))), |s: &str| {
+        s.parse::<f64>()
+    })
     .parse(input)
 }
 
@@ -561,7 +675,10 @@ mod tests {
     fn test_repeat() {
         let m = parse_mini("x*4").unwrap();
         assert_eq!(m.sequence.steps[0].atom, Atom::Trigger);
-        assert_eq!(m.sequence.steps[0].modifiers, vec![Modifier::Repeat(Ramp::fixed(4))]);
+        assert_eq!(
+            m.sequence.steps[0].modifiers,
+            vec![Modifier::Repeat(Ramp::fixed(4))]
+        );
     }
 
     #[test]
@@ -715,7 +832,10 @@ mod tests {
         let m = parse_mini("[c4 e4]*3").unwrap();
         assert_eq!(m.sequence.steps.len(), 1);
         assert!(matches!(m.sequence.steps[0].atom, Atom::Group(_)));
-        assert_eq!(m.sequence.steps[0].modifiers, vec![Modifier::Repeat(Ramp::fixed(3))]);
+        assert_eq!(
+            m.sequence.steps[0].modifiers,
+            vec![Modifier::Repeat(Ramp::fixed(3))]
+        );
     }
 
     // ---- Stacked modifiers ----
@@ -736,7 +856,10 @@ mod tests {
         let m = parse_mini("x(5,8)?0.25").unwrap();
         assert_eq!(
             m.sequence.steps[0].modifiers,
-            vec![Modifier::Euclidean(Ramp::fixed(5), Ramp::fixed(8), None), Modifier::Drop(Some(Ramp::fixed(0.25)))]
+            vec![
+                Modifier::Euclidean(Ramp::fixed(5), Ramp::fixed(8), None),
+                Modifier::Drop(Some(Ramp::fixed(0.25)))
+            ]
         );
     }
 
@@ -754,7 +877,10 @@ mod tests {
     #[test]
     fn test_drop_with_probability() {
         let m = parse_mini("x?0.3").unwrap();
-        assert_eq!(m.sequence.steps[0].modifiers, vec![Modifier::Drop(Some(Ramp::fixed(0.3)))]);
+        assert_eq!(
+            m.sequence.steps[0].modifiers,
+            vec![Modifier::Drop(Some(Ramp::fixed(0.3)))]
+        );
     }
 
     // ---- Solo ----
@@ -764,19 +890,31 @@ mod tests {
         let m = parse_mini("solo(0..7, 8)").unwrap();
         assert_eq!(
             m.sequence.steps[0].atom,
-            Atom::Solo(Solo { low: 0, high: 7, steps: Ramp::fixed(8) })
+            Atom::Solo(Solo {
+                low: 0,
+                high: 7,
+                steps: Ramp::fixed(8)
+            })
         );
         // Negative degrees walk below the root octave.
         let m = parse_mini("solo(-3..4,6)").unwrap();
         assert_eq!(
             m.sequence.steps[0].atom,
-            Atom::Solo(Solo { low: -3, high: 4, steps: Ramp::fixed(6) })
+            Atom::Solo(Solo {
+                low: -3,
+                high: 4,
+                steps: Ramp::fixed(6)
+            })
         );
         // The step count may travel across the line's ramp span.
         let m = parse_mini("solo(0..12, 4..16)").unwrap();
         assert_eq!(
             m.sequence.steps[0].atom,
-            Atom::Solo(Solo { low: 0, high: 12, steps: Ramp::Sweep { from: 4, to: 16 } })
+            Atom::Solo(Solo {
+                low: 0,
+                high: 12,
+                steps: Ramp::Sweep { from: 4, to: 16 }
+            })
         );
     }
 
@@ -856,7 +994,10 @@ mod tests {
         assert_eq!(
             m.sequence.steps[0].modifiers,
             vec![Modifier::Euclidean(
-                Ramp::Steps { first: 2, rest: vec![4, 8, 16] },
+                Ramp::Steps {
+                    first: 2,
+                    rest: vec![4, 8, 16]
+                },
                 Ramp::fixed(4),
                 None
             )]
@@ -865,7 +1006,10 @@ mod tests {
         let m = parse_mini("x*4>8>16").unwrap();
         assert_eq!(
             m.sequence.steps[0].modifiers,
-            vec![Modifier::Repeat(Ramp::Steps { first: 4, rest: vec![8, 16] })]
+            vec![Modifier::Repeat(Ramp::Steps {
+                first: 4,
+                rest: vec![8, 16]
+            })]
         );
 
         let m = parse_mini("x?0.2>0.6>0.9").unwrap();
@@ -883,7 +1027,10 @@ mod tests {
         // `<x*4>` must still parse: the chain has to backtrack off the `>`.
         let m = parse_mini("<x*4 x*8>").unwrap();
         let Atom::Alternation(ref alternation) = m.sequence.steps[0].atom else {
-            panic!("expected an alternation, got {:?}", m.sequence.steps[0].atom);
+            panic!(
+                "expected an alternation, got {:?}",
+                m.sequence.steps[0].atom
+            );
         };
         assert_eq!(alternation.sequence.steps.len(), 2);
         assert_eq!(
@@ -923,6 +1070,130 @@ mod tests {
         assert_eq!(m.sequence.steps.len(), 2);
         assert_eq!(m.sequence.steps[0].modifiers, vec![Modifier::Drop(None)]);
         assert_eq!(m.sequence.steps[1].atom, Atom::Degree(0));
+    }
+
+    // ---- Velocity and accent ----
+
+    #[test]
+    fn test_accent_is_a_full_velocity_trigger() {
+        let m = parse_mini("X ~ x ~").unwrap();
+        assert_eq!(m.sequence.steps[0].atom, Atom::Trigger);
+        assert_eq!(m.sequence.steps[0].velocity, Some(Ramp::fixed(1.0)));
+        // Lowercase keeps meaning "normal", i.e. take the line's `vel`.
+        assert_eq!(m.sequence.steps[2].atom, Atom::Trigger);
+        assert_eq!(m.sequence.steps[2].velocity, None);
+        // And it is exactly the `:1.0` spelling.
+        assert_eq!(parse_mini("X").unwrap(), parse_mini("x:1.0").unwrap());
+    }
+
+    #[test]
+    fn test_explicit_velocity_on_any_sounding_atom() {
+        let velocity = |source: &str| {
+            parse_mini(source).unwrap().sequence.steps[0]
+                .velocity
+                .clone()
+        };
+        assert_eq!(velocity("x:0.6"), Some(Ramp::fixed(0.6)));
+        assert_eq!(velocity("c4:0.35"), Some(Ramp::fixed(0.35)));
+        assert_eq!(velocity("3:0.5"), Some(Ramp::fixed(0.5)));
+        assert_eq!(velocity("[c4 e4]:0.8"), Some(Ramp::fixed(0.8)));
+        assert_eq!(velocity("<c4 e4>:0.8"), Some(Ramp::fixed(0.8)));
+        assert_eq!(velocity("solo(0..7,8):0.7"), Some(Ramp::fixed(0.7)));
+        // An inner step keeps its own, so a group's velocity is only a default.
+        let m = parse_mini("[c4 e4:0.4]:0.9").unwrap();
+        assert_eq!(m.sequence.steps[0].velocity, Some(Ramp::fixed(0.9)));
+        let Atom::Group(ref group) = m.sequence.steps[0].atom else {
+            panic!("expected a group");
+        };
+        assert_eq!(group.layers[0].steps[1].velocity, Some(Ramp::fixed(0.4)));
+    }
+
+    #[test]
+    fn test_velocity_composes_with_slot_generating_modifiers() {
+        // Written once, whichever side of the modifier — one velocity for every
+        // slot the step generates.
+        let m = parse_mini("X*4").unwrap();
+        assert_eq!(
+            m.sequence.steps[0].modifiers,
+            vec![Modifier::Repeat(Ramp::fixed(4))]
+        );
+        assert_eq!(m.sequence.steps[0].velocity, Some(Ramp::fixed(1.0)));
+
+        assert_eq!(
+            parse_mini("x:0.6*4").unwrap(),
+            parse_mini("x*4:0.6").unwrap()
+        );
+
+        let m = parse_mini("x:0.6?0.25").unwrap();
+        assert_eq!(
+            m.sequence.steps[0].modifiers,
+            vec![Modifier::Drop(Some(Ramp::fixed(0.25)))]
+        );
+        assert_eq!(m.sequence.steps[0].velocity, Some(Ramp::fixed(0.6)));
+
+        let m = parse_mini("x(3,8):0.9").unwrap();
+        assert_eq!(
+            m.sequence.steps[0].modifiers,
+            vec![Modifier::Euclidean(Ramp::fixed(3), Ramp::fixed(8), None)]
+        );
+        assert_eq!(m.sequence.steps[0].velocity, Some(Ramp::fixed(0.9)));
+    }
+
+    #[test]
+    fn test_velocity_may_travel() {
+        let m = parse_mini("x:0.3..0.9").unwrap();
+        assert_eq!(
+            m.sequence.steps[0].velocity,
+            Some(Ramp::Sweep { from: 0.3, to: 0.9 })
+        );
+        assert!(m.sequence.steps[0].velocity.as_ref().unwrap().travels());
+        let m = parse_mini("x:0.3>0.6>0.9").unwrap();
+        assert_eq!(
+            m.sequence.steps[0].velocity,
+            Some(Ramp::Steps {
+                first: 0.3,
+                rest: vec![0.6, 0.9]
+            })
+        );
+        // A closing `>` is still left for the alternation.
+        let m = parse_mini("<x:0.4 x:0.8>").unwrap();
+        let Atom::Alternation(ref alternation) = m.sequence.steps[0].atom else {
+            panic!("expected an alternation");
+        };
+        assert_eq!(
+            alternation.sequence.steps[1].velocity,
+            Some(Ramp::fixed(0.8))
+        );
+    }
+
+    #[test]
+    fn test_velocity_out_of_range_is_rejected_at_every_value() {
+        let error = parse_mini("x:1.4").unwrap_err();
+        assert!(
+            error.contains("1.4") && error.contains("0.0-1.0"),
+            "{error}"
+        );
+        assert!(parse_mini("x:0.5..1.2").unwrap_err().contains("1.2"));
+        assert!(parse_mini("x:0.2>0.9>1.1").unwrap_err().contains("1.1"));
+        // Validation reaches nested layers like every other check.
+        assert!(parse_mini("[c4 e4:2]").is_err());
+    }
+
+    #[test]
+    fn test_velocity_on_a_rest_or_a_hold_is_rejected() {
+        let error = parse_mini("~:0.5").unwrap_err();
+        assert!(error.contains("rest"), "{error}");
+        let error = parse_mini("x _:0.5").unwrap_err();
+        assert!(error.contains("hold"), "{error}");
+    }
+
+    #[test]
+    fn test_one_velocity_per_step() {
+        let error = parse_mini("x:0.6:0.8").unwrap_err();
+        assert!(error.contains("one velocity"), "{error}");
+        // `X` already set one.
+        let error = parse_mini("X:0.6").unwrap_err();
+        assert!(error.contains("already a velocity of 1.0"), "{error}");
     }
 
     // ---- Random choice ----

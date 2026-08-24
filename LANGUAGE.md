@@ -164,6 +164,9 @@ the instrument to fire once. Which sound is produced depends on the instrument.
 "x x x x"           -- four triggers per cycle
 ```
 
+An uppercase `X` is an **accented** trigger — the same event at full velocity
+(§3.17).
+
 ### 3.4 Rest
 
 The tilde `~` represents silence for the duration of its slot.
@@ -351,7 +354,58 @@ The `@` suffix makes a step N times longer than normal (default weight = 1).
 
 N must be a positive integer.
 
-### 3.17 Stacking Modifiers
+### 3.17 Velocity and Accent: `X` and `:v`
+
+How hard a step is struck is written on the step, not only on the line. Two
+spellings, because accenting a backbeat and dialling in a ghost note are
+different jobs:
+
+```
+"X ~ x ~"           -- accented downbeat, then a normal trigger
+"x:0.6 x:0.3"       -- an explicit velocity per step
+"c4:0.35 e4"        -- works on any sounding atom, not only triggers
+"[c4 e4]:0.8"       -- one velocity for everything the group sounds
+```
+
+`X` is an accent: **full velocity, 1.0**. It is exactly `x:1.0` and is stored
+as such, so a consumer that honours `:v` honours `X` for free. Lowercase `x`
+keeps its old meaning — "normal", taking whatever the line's `vel` says. `X` is
+unambiguous because note letters are `a`–`g`, so no note spelling collides with
+it. Writing both (`X:0.6`) is an error: it sets two velocities on one step.
+
+`:v` is an explicit velocity in `0.0..=1.0`, valid on any **sounding** atom —
+a note, a degree, a trigger, a `solo(..)`, a group, or an alternation. A rest
+(`~:0.5`) or a hold (`_:0.5`) carrying a velocity is meaningless and is
+rejected rather than ignored: a hold sustains the event it extends, so it has
+no strike of its own to weight.
+
+On a group or an alternation, the velocity applies to every event the step
+sounds; a step **inside** it that names its own velocity wins for that step, so
+`"[c4 e4:0.4]:0.9"` is a loud C and a quiet E.
+
+The velocity may travel like any other value (§4.6), which is how a per-step
+swell is written:
+
+```
+sn snare "x:0.3..0.9"     | ramp 8    -- each hit grows over eight cycles
+sn snare "x:0.3>0.6>0.9"  | ramp 12   -- three held stages instead
+```
+
+**Interaction with `| vel`.** `:v` and `X` are **absolute**: they set the
+step's velocity and override the line's `vel` for that step. `| vel` supplies
+the default for every step that specifies neither. So in
+
+```
+sn snare "X x x:0.4 x" | vel 0.7
+```
+
+the four steps are struck at 1.0, 0.7, 0.4 and 0.7. Nothing multiplies: a
+performer nudging `vel` to balance a line must not have to recompute the
+accents they already placed. (The one place velocity *does* multiply is a
+group's shared `| vel`, §7.2, which is a bus level rather than a step's
+strike.)
+
+### 3.18 Stacking Modifiers
 
 More than one modifier may follow an atom. They apply **left to right in the
 order written**. The slot-generating modifiers (`*N`, `!N`, `(k,n)`) run first
@@ -370,7 +424,13 @@ earlier one produced as its payload, rather than re-gridding it.
 `/N` is the exception: it stretches the whole pattern line over N cycles rather
 than only its own step.
 
-### 3.18 Generated Solo: `solo(low..high, steps)`
+A velocity suffix (§3.17) may be written anywhere in the run of modifiers and
+means the same thing wherever it sits, because it is a property of the step
+rather than a transformation of its slots: `"X*4"`, `"x:0.6?0.25"` and
+`"x(3,8):0.9"` all give **every** slot the step generates that velocity. Only
+one velocity per step, so `"x:0.6:0.8"` is an error.
+
+### 3.19 Generated Solo: `solo(low..high, steps)`
 
 A `solo` atom asks Treble to write the melody for you: a weighted random walk
 over the scale degrees `low..high` (inclusive, resolved against the active
@@ -482,6 +542,9 @@ Transforms split into two families:
 `vel` and `gain` are distinct. `vel` is how hard the note is struck and reaches
 the instrument's envelopes and velocity sensitivity; `gain` is the level of the
 signal leaving them.
+
+`vel` is the line's **default** strike: a step that names its own velocity with
+`X` or `:v` (§3.17) overrides it for that step.
 
 A transform's arity is fixed. Trailing arguments are an error, so a typo such as
 `| pan -1.0 0.5` is reported rather than half-read.
@@ -1060,22 +1123,25 @@ choice        = sequence { "|" sequence } ;
 note          = note_name [ accidental ] octave ;
 degree        = integer ;
 trigger       = "x" ;
+accent        = "X" ;                (* = trigger at velocity 1.0 *)
 rest          = "~" ;
 hold          = "_" ;
+solo          = "solo" "(" signed_integer ".." signed_integer "," range ")" ;
 note_name     = "a" | "b" | "c" | "d" | "e" | "f" | "g" ;
 accidental    = "#" | "b" | "##" | "bb" ;
 octave        = digit ;
 modifier      = repeat | slow_mod | replicate | euclidean | drop | weight ;
-repeat        = "*" integer ;
+repeat        = "*" range ;
 slow_mod      = "/" integer ;
 replicate     = "!" integer ;
 euclidean     = "(" onsets "," positions [ "," offset ] ")" ;
                 (* onsets may exceed positions; positions >= 1 *)
-onsets        = integer ;
-positions     = integer ;
+onsets        = range ;
+positions     = range ;
 offset        = integer ;
-drop          = "?" [ number ] ;   (* no whitespace before the number *)
+drop          = "?" [ range ] ;    (* no whitespace before the number *)
 weight        = "@" integer ;
+velocity      = ":" range ;        (* 0.0..=1.0; not on a rest or a hold *)
 
 pitch_root    = upper_note_name [ accidental ] ;
 upper_note_name = "A" | "B" | "C" | "D" | "E" | "F" | "G" ;
@@ -1101,18 +1167,20 @@ bpm 128
 sig 4/4
 
 kick  kick   "x ~ x ~"
-snare snare  "~ x ~ x"
-hats  hihat  "x*8"
+snare snare  "~ X ~ x"
+hats  hihat  "x*8 x:0.4*8"
 
-bass  saw    "c2 _ eb2 _ g1 _ f2 _" | pan -0.3
+bass  saw    "c2 _ eb2 _ g1 _ f2 _" | pan -0.3 | lpf 300..9000 | ramp 16 exp
 lead  piano  "c4 eb4 g4 bb4" | slow 2 | vel 0.8 | pan sine 4 0.6
 
 ; pad  pad   "[c3,eb3,g3] ~ [f3,ab3,c4] ~"
 ```
 
 This defines:
-- Three drum loops: 4-on-the-floor kick, backbeat snare, 8th-note hats
-- A bass line stepping through C, Eb, G, F (each held 2 slots)
+- Three drum loops: 4-on-the-floor kick, a backbeat snare accenting beat 2,
+  and hats that drop to a ghost velocity for the second half of the cycle
+- A bass line stepping through C, Eb, G, F (each held 2 slots), under a filter
+  that opens from 300 Hz to 9 kHz over sixteen cycles, geometrically
 - A piano lead playing a Cm7 arpeggio over 2 cycles
 - A muted pad pattern (ready to unmute by removing `;`)
 
@@ -1130,7 +1198,8 @@ This defines:
 - Probability weights on random choice (`[c4@3|e4@1]`)
 - Structural transforms beyond `every`: `rot`, `palindrome`, `iter`, `ply`,
   `off`, `stut`, `jux`, `chunk`
-- Per-step velocity/accent syntax
+- Ranges on a group's shared chain (§7.2)
+- Curves beyond `lin` and `exp` (`log`, an eased `s`), and per-value curves
 - LFO sweeps on parameters other than `pan` (`lpf`, `gain`, …), which need one
   modulated filter per parameter in the engine
 - Phase offset on a sweep, so two lines can be counter-panned against each other

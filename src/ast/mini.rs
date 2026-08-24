@@ -30,14 +30,42 @@ pub struct Sequence {
     pub steps: Vec<Step>,
 }
 
-/// A single step in a sequence: an atom with zero or more modifiers.
+/// A single step in a sequence: an atom, zero or more modifiers, and an
+/// optional velocity.
 ///
 /// Modifiers stack and are applied left-to-right in written order, so `x*8?`
 /// first expands into eight slots and then gives each of them a drop chance.
+///
+/// Velocity is a **field rather than a [`Modifier`]** because it is a property
+/// of the step, not a transformation of the slots a modifier produced. The
+/// slot-generating modifiers (`*N`, `!N`, `(k,n)`) run first and build the
+/// slots; a velocity written anywhere in the run — `x:0.6*4` or `x*4:0.6` —
+/// therefore applies to every slot the step generates, and cannot be read as
+/// applying to only the slots that existed when it was written. It also makes
+/// "at most one velocity per step" a type invariant instead of a check.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
     pub atom: Atom,
     pub modifiers: Vec<Modifier>,
+    /// `:v`, or `1.0` for the accent spelling `X` — an **absolute** velocity in
+    /// `0.0..=1.0` that overrides the line's `vel` for this step. `None` takes
+    /// the line's `vel`. May travel across the line's `ramp` span, which is how
+    /// a per-step swell (`x:0.3..0.9`) is written.
+    ///
+    /// On a group or an alternation this is the velocity of everything the step
+    /// sounds, except where an inner step names its own.
+    pub velocity: Option<Ramp<f64>>,
+}
+
+impl Step {
+    /// A step with no modifiers and no velocity.
+    pub fn bare(atom: Atom) -> Self {
+        Self {
+            atom,
+            modifiers: Vec::new(),
+            velocity: None,
+        }
+    }
 }
 
 /// The core building blocks of the mini-notation.
@@ -47,7 +75,9 @@ pub enum Atom {
     Note(Note),
     /// A scale degree: `0`, `3`, `7`
     Degree(i32),
-    /// A drum trigger: `x`
+    /// A drum trigger: `x`, or `X` for the accented spelling — which is stored
+    /// as this atom with [`Step::velocity`] set to `1.0`, so a consumer that
+    /// honours `:v` honours `X` without knowing it exists.
     Trigger,
     /// Silence for this slot: `~`
     Rest,
