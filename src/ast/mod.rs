@@ -4,8 +4,10 @@
 //! Session evaluator.  It closely mirrors the language grammar from
 //! LANGUAGE.md.
 
+pub mod instrument;
 pub mod mini;
 pub mod program;
 
+pub use instrument::*;
 pub use mini::*;
 pub use program::*;
