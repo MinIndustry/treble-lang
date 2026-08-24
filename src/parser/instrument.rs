@@ -82,12 +82,8 @@ pub fn parse_instrument_def(lines: &[&str]) -> Result<InstrumentDef, String> {
         "env",
         &definition.name,
     )?;
-    definition.pitch = merge_envelope(
-        definition.pitch,
-        pitch_stages,
-        "pitchenv",
-        &definition.name,
-    )?;
+    definition.pitch =
+        merge_envelope(definition.pitch, pitch_stages, "pitchenv", &definition.name)?;
     if definition.tones.is_empty() && definition.sample.is_none() {
         return Err(format!(
             "{}: a definition needs at least one 'tone' line or a 'sample'",
@@ -208,8 +204,11 @@ fn apply_line(
         }
         "velsens" => {
             once(&definition.velocity_sensitivity, "velsens", &name)?;
-            definition.velocity_sensitivity =
-                Some(number(required(&mut parts, "velsens", &name)?, "velsens", &name)?);
+            definition.velocity_sensitivity = Some(number(
+                required(&mut parts, "velsens", &name)?,
+                "velsens",
+                &name,
+            )?);
         }
         "base" => {
             once(&definition.base_frequency, "base", &name)?;
@@ -224,15 +223,14 @@ fn apply_line(
         }
     }
     if let Some(extra) = parts.next() {
-        return Err(format!("{name}: '{keyword}' has an extra argument '{extra}'"));
+        return Err(format!(
+            "{name}: '{keyword}' has an extra argument '{extra}'"
+        ));
     }
     Ok(())
 }
 
-fn parse_voice(
-    parts: &mut std::str::SplitWhitespace,
-    name: &str,
-) -> Result<VoiceDef, String> {
+fn parse_voice(parts: &mut std::str::SplitWhitespace, name: &str) -> Result<VoiceDef, String> {
     match required(parts, "voice", name)? {
         "mono" => {
             let mut track_pitch = true;
@@ -306,17 +304,27 @@ fn parse_tone(header: &str, nested: &[&str], name: &str) -> Result<ToneDef, Stri
 
     while let Some(option) = parts.next() {
         match option {
-            "gain" => tone.gain = Some(number(required(&mut parts, "tone gain", name)?, "tone gain", name)?),
+            "gain" => {
+                tone.gain = Some(number(
+                    required(&mut parts, "tone gain", name)?,
+                    "tone gain",
+                    name,
+                )?)
+            }
             "freq" => {
-                tone.frequency =
-                    Some(number(required(&mut parts, "tone freq", name)?, "tone freq", name)?)
+                tone.frequency = Some(number(
+                    required(&mut parts, "tone freq", name)?,
+                    "tone freq",
+                    name,
+                )?)
             }
             "identity" => tone.relation = Some(Relation::Identity),
             "harmonic" => {
                 let text = required(&mut parts, "tone harmonic", name)?;
-                tone.relation = Some(Relation::Harmonic(text.parse().map_err(|_| {
-                    format!("{name}: '{text}' is not a harmonic number")
-                })?));
+                tone.relation =
+                    Some(Relation::Harmonic(text.parse().map_err(|_| {
+                        format!("{name}: '{text}' is not a harmonic number")
+                    })?));
             }
             "ratio" => {
                 tone.relation = Some(Relation::Ratio(number(
@@ -334,9 +342,10 @@ fn parse_tone(header: &str, nested: &[&str], name: &str) -> Result<ToneDef, Stri
             }
             "semitones" => {
                 let text = required(&mut parts, "tone semitones", name)?;
-                tone.relation = Some(Relation::Semitones(text.parse().map_err(|_| {
-                    format!("{name}: '{text}' is not a semitone count")
-                })?));
+                tone.relation =
+                    Some(Relation::Semitones(text.parse().map_err(|_| {
+                        format!("{name}: '{text}' is not a semitone count")
+                    })?));
             }
             "const" => {
                 tone.relation = Some(Relation::Constant(number(
@@ -442,7 +451,9 @@ fn parse_envelope_line(
                 _ => &mut stages.release,
             };
             if target.is_some() {
-                return Err(format!("{name}: '{keyword} {stage}' is given more than once"));
+                return Err(format!(
+                    "{name}: '{keyword} {stage}' is given more than once"
+                ));
             }
             *target = Some(segment);
             stages.seen = true;
@@ -681,7 +692,8 @@ mod tests {
 
     #[test]
     fn a_block_coexists_with_pattern_lines() {
-        let source = "bpm 120\ndef wobble {\n    tone saw\n}\nbass wobble \"0 _ 3 _\"\nkick kick \"x ~\"";
+        let source =
+            "bpm 120\ndef wobble {\n    tone saw\n}\nbass wobble \"0 _ 3 _\"\nkick kick \"x ~\"";
         let (program, errors) = parse_program(source);
         assert!(errors.is_empty(), "{errors:?}");
         // bpm, def, two patterns.
@@ -754,7 +766,10 @@ mod tests {
         assert_eq!(definition.tones[2].relation, Some(Relation::Harmonic(3)));
         assert_eq!(definition.tones[3].relation, Some(Relation::Semitones(-12)));
         assert_eq!(definition.tones[4].relation, Some(Relation::Offset(4.0)));
-        assert_eq!(definition.tones[5].relation, Some(Relation::Constant(440.0)));
+        assert_eq!(
+            definition.tones[5].relation,
+            Some(Relation::Constant(440.0))
+        );
         assert_eq!(definition.tones[6].relation, Some(Relation::Identity));
 
         // Stage lines accumulate into one envelope.

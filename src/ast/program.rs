@@ -118,7 +118,12 @@ pub enum ScaleMode {
 /// Transforms split into two families, which matters to consumers: `Rev`,
 /// `Fast`, `Slow`, `Arp`, `Scale`, `Oct` and `Vel` reshape the scheduled
 /// events, while `Gain`, `Pan`, `Lpf`, `Hpf`, `Delay` and `Reverb` describe an
-/// ordered DSP chain and can only change at a graph rebuild.
+/// ordered DSP chain.
+///
+/// Every numeric argument is a [`Ramp`], so any of them may travel across the
+/// line's [`Transform::RampSpan`] (§4.6). A parameter that only ever holds one
+/// value is a `Ramp::Fixed`, and [`Ramp::travels`] is how a consumer tells the
+/// two apart.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Transform {
     Rev,
@@ -128,18 +133,24 @@ pub enum Transform {
     Arp(ArpMode),
     Scale(PitchRoot, ScaleMode),
     Oct(Ramp<i32>),
-    /// `vel <0.0..=1.0>` — note velocity.
+    /// `vel <0.0..=1.0>` — the line's default note velocity. A step that names
+    /// its own velocity (`X`, `:v` — see [`crate::ast::mini::Step`]) overrides
+    /// this for that step.
     Vel(Ramp<f64>),
-    /// `ramp <cycles>` — how long the line's ranges take to travel.
-    RampSpan(u32),
+    /// `ramp <cycles> [lin|exp]` — how long the line's ranges take to travel,
+    /// and how they get there. One span governs every range on the line.
+    RampSpan {
+        cycles: u32,
+        curve: RampCurve,
+    },
     /// `gain <0.0..=2.0>` — output level, positional in the DSP chain.
-    Gain(f64),
+    Gain(Ramp<f64>),
     /// `pan <-1.0..=1.0>` — a fixed stereo position, positional in the chain.
-    Pan(f64),
+    Pan(Ramp<f64>),
     /// `pan <wave> <rate>[hz] [depth]` — a stereo position swept by an LFO.
     AutoPan(PanSweep),
-    Lpf(f64),
-    Hpf(f64),
+    Lpf(Ramp<f64>),
+    Hpf(Ramp<f64>),
     /// `fx <filter> <arg>...`, or one of its short aliases.
     ///
     /// The filter is named but not resolved here: this crate has no knowledge
@@ -147,8 +158,25 @@ pub enum Transform {
     /// registry and reports an unknown one.
     Fx(FxCall),
     /// `delay <time> <feedback> [mix]` — the wet mix defaults to 0.35.
-    Delay(f64, f64, Option<f64>),
-    Reverb(f64),
+    Delay(Ramp<f64>, Ramp<f64>, Option<Ramp<f64>>),
+    Reverb(Ramp<f64>),
+}
+
+/// How a range gets from one end to the other across the `ramp` span.
+///
+/// The crate records the intent only. `Exp` asks for geometric interpolation —
+/// equal ratio steps rather than equal value steps, which is what a filter
+/// cutoff needs to sound like a steady opening — but resolving it is the
+/// consumer's job, including deciding what to do with a range that touches or
+/// crosses zero, where a geometric path does not exist.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RampCurve {
+    /// `lin`, and the default when the curve is omitted, so buffers written
+    /// before curves existed keep their meaning.
+    #[default]
+    Linear,
+    /// `exp` — equal ratio steps.
+    Exponential,
 }
 
 /// Arpeggiator mode.
@@ -208,17 +236,32 @@ pub enum FxArg {
     Named(String, FxValue),
 }
 
-/// An argument's value.
+/// An argument's value, which may travel across the line's `ramp` span.
 ///
 /// The distinction is syntactic on purpose. Whether a bare number is a literal
 /// parameter value or a period in cycles depends on the parameter it lands on,
-/// which only the consumer knows.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// which only the consumer knows. The legal interval is likewise the filter's
+/// own business, so nothing here range-checks the values.
+#[derive(Debug, Clone, PartialEq)]
 pub enum FxValue {
-    /// A bare number.
-    Plain(f64),
+    /// A bare number: `0.6`, `2..8`.
+    Plain(Ramp<f64>),
     /// A number with an `hz` suffix, so always an absolute frequency.
-    Hertz(f64),
+    Hertz(Ramp<f64>),
+}
+
+impl FxValue {
+    /// The ramp inside, whichever spelling it arrived in.
+    pub fn ramp(&self) -> &Ramp<f64> {
+        match self {
+            Self::Plain(ramp) | Self::Hertz(ramp) => ramp,
+        }
+    }
+
+    /// Whether this argument travels, and so needs the line to have a `ramp`.
+    pub fn travels(&self) -> bool {
+        self.ramp().travels()
+    }
 }
 
 /// A value that may travel over the line's [`Transform::RampSpan`].

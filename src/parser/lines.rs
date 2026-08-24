@@ -70,7 +70,9 @@ fn parse_group_header(line: &str, muted: bool) -> Result<SourceLine, String> {
     let rest = strip_keyword(line, "group")
         .ok_or_else(|| "group: expected 'group <name> {'".to_string())?;
     let Some(name) = rest.strip_suffix('{') else {
-        return Err("group: the header must end with '{' (filters go on the closing '}')".to_string());
+        return Err(
+            "group: the header must end with '{' (filters go on the closing '}')".to_string(),
+        );
     };
     let name = name.trim();
     validate_identifier(name).map_err(|error| format!("group: {error}"))?;
@@ -112,10 +114,12 @@ fn strip_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
 /// A drop has to land on the top of a phrase, not merely on the next cycle, so
 /// this is what the consumer aligns its snapshot swaps to.
 fn parse_phrase(input: &str) -> Result<SourceLine, String> {
-    let cycles: u32 = input
-        .trim()
-        .parse()
-        .map_err(|_| format!("phrase: expected a number of cycles, got '{}'", input.trim()))?;
+    let cycles: u32 = input.trim().parse().map_err(|_| {
+        format!(
+            "phrase: expected a number of cycles, got '{}'",
+            input.trim()
+        )
+    })?;
     if cycles == 0 {
         return Err("phrase: a phrase is at least one cycle".to_string());
     }
@@ -303,7 +307,19 @@ fn parse_transform_keyword(
             if cycles == 0 {
                 return Err("ramp: a span needs at least one cycle".to_string());
             }
-            Ok(Transform::RampSpan(cycles))
+            // Omitting the curve means `lin`, so every buffer written before
+            // curves existed keeps its meaning.
+            let curve = match parts.next() {
+                None => RampCurve::Linear,
+                Some("lin") => RampCurve::Linear,
+                Some("exp") => RampCurve::Exponential,
+                Some(other) => {
+                    return Err(format!(
+                        "ramp: '{other}' is not a curve; use 'lin' (the default) or 'exp'"
+                    ));
+                }
+            };
+            Ok(Transform::RampSpan { cycles, curve })
         }
         "every" => {
             let n_str = parts
@@ -350,44 +366,66 @@ fn parse_transform_keyword(
             };
             Ok(Transform::Oct(ramp_from_text(text, "oct", parse)?))
         }
-        "vel" => Ok(Transform::Vel(parse_transform_ramp(parts, "vel")?)),
+        "vel" => {
+            let vel = parse_transform_ramp(parts, "vel")?;
+            validate_within("vel", &vel, 0.0, 1.0)?;
+            Ok(Transform::Vel(vel))
+        }
         "gain" => {
-            let val = parse_transform_f64(parts, "gain")?;
-            Ok(Transform::Gain(val))
+            let gain = parse_transform_ramp(parts, "gain")?;
+            validate_within("gain", &gain, 0.0, 2.0)?;
+            Ok(Transform::Gain(gain))
         }
         "pan" => {
             let first = parts
                 .next()
                 .ok_or_else(|| "pan: expected a position or a waveform".to_string())?;
-            // A number is a fixed position; anything else must name a waveform.
-            match first.parse::<f64>() {
-                Ok(position) => Ok(Transform::Pan(position)),
-                Err(_) => Ok(Transform::AutoPan(parse_pan_sweep(first, parts)?)),
+            // A number, or a range of them, is a fixed position; anything else
+            // must name a waveform. The first character decides, so `-0.4..0.4`
+            // is read as a position rather than as an unknown waveform.
+            if first.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+' || c == '.') {
+                let position = ramp_from_text(first, "pan", |part| {
+                    part.parse::<f64>()
+                        .map_err(|_| format!("pan: invalid position '{}'", part))
+                })?;
+                validate_within("pan", &position, -1.0, 1.0)?;
+                Ok(Transform::Pan(position))
+            } else {
+                Ok(Transform::AutoPan(parse_pan_sweep(first, parts)?))
             }
         }
         "lpf" => {
-            let val = parse_transform_f64(parts, "lpf")?;
-            Ok(Transform::Lpf(val))
+            let cutoff = parse_transform_ramp(parts, "lpf")?;
+            validate_at_least("lpf", &cutoff, 0.0)?;
+            Ok(Transform::Lpf(cutoff))
         }
         "hpf" => {
-            let val = parse_transform_f64(parts, "hpf")?;
-            Ok(Transform::Hpf(val))
+            let cutoff = parse_transform_ramp(parts, "hpf")?;
+            validate_at_least("hpf", &cutoff, 0.0)?;
+            Ok(Transform::Hpf(cutoff))
         }
         "delay" => {
-            let time = parse_transform_f64(parts, "delay time")?;
-            let fb = parse_transform_f64(parts, "delay feedback")?;
+            let time = parse_transform_ramp(parts, "delay time")?;
+            validate_at_least("delay time", &time, 0.0)?;
+            let feedback = parse_transform_ramp(parts, "delay feedback")?;
+            validate_within("delay feedback", &feedback, 0.0, 0.99)?;
             let mix = match parts.next() {
-                Some(text) => Some(
-                    text.parse::<f64>()
-                        .map_err(|_| format!("delay mix: invalid number '{}'", text))?,
-                ),
+                Some(text) => {
+                    let mix = ramp_from_text(text, "delay mix", |part| {
+                        part.parse::<f64>()
+                            .map_err(|_| format!("delay mix: invalid number '{}'", part))
+                    })?;
+                    validate_within("delay mix", &mix, 0.0, 1.0)?;
+                    Some(mix)
+                }
                 None => None,
             };
-            Ok(Transform::Delay(time, fb, mix))
+            Ok(Transform::Delay(time, feedback, mix))
         }
         "reverb" => {
-            let val = parse_transform_f64(parts, "reverb")?;
-            Ok(Transform::Reverb(val))
+            let amount = parse_transform_ramp(parts, "reverb")?;
+            validate_within("reverb", &amount, 0.0, 1.0)?;
+            Ok(Transform::Reverb(amount))
         }
         // A raw engine filter, named explicitly.
         "fx" => {
@@ -464,7 +502,9 @@ fn parse_fx_call(filter: &str, parts: &mut std::str::SplitWhitespace) -> Result<
                         "{filter}: '{token}' comes after a named argument; give it a name too"
                     ));
                 }
-                args.push(FxArg::Positional(parse_fx_value(filter, "argument", token)?));
+                args.push(FxArg::Positional(parse_fx_value(
+                    filter, "argument", token,
+                )?));
             }
         }
     }
@@ -476,22 +516,30 @@ fn parse_fx_call(filter: &str, parts: &mut std::str::SplitWhitespace) -> Result<
 
 fn parse_fx_value(filter: &str, label: &str, text: &str) -> Result<FxValue, String> {
     let lowered = text.to_ascii_lowercase();
-    match lowered.strip_suffix("hz") {
-        Some(number) => number
-            .parse::<f64>()
-            .map(FxValue::Hertz)
-            .map_err(|_| format!("{filter} {label}: invalid frequency '{text}'")),
-        None => text
-            .parse::<f64>()
-            .map(FxValue::Plain)
-            .map_err(|_| format!("{filter} {label}: invalid number '{text}'")),
-    }
+    let (number, hertz) = match lowered.strip_suffix("hz") {
+        Some(number) => (number, true),
+        None => (lowered.as_str(), false),
+    };
+    let name = format!("{filter} {label}");
+    let ramp = ramp_from_text(number, &name, |part| {
+        part.parse::<f64>().map_err(|_| {
+            if hertz {
+                format!("{name}: invalid frequency '{text}'")
+            } else {
+                format!("{name}: invalid number '{text}'")
+            }
+        })
+    })?;
+    // Nothing range-checks these: which interval a filter's parameter accepts
+    // is the consumer's registry to know, not this crate's (§4.5).
+    Ok(if hertz {
+        FxValue::Hertz(ramp)
+    } else {
+        FxValue::Plain(ramp)
+    })
 }
 
-fn parse_pan_sweep(
-    wave: &str,
-    parts: &mut std::str::SplitWhitespace,
-) -> Result<PanSweep, String> {
+fn parse_pan_sweep(wave: &str, parts: &mut std::str::SplitWhitespace) -> Result<PanSweep, String> {
     let wave = parse_lfo_wave(wave)?;
     let rate_text = parts
         .next()
@@ -583,18 +631,28 @@ fn ramp_from_text<T: Copy>(
     Ok(Ramp::steps(first, rest))
 }
 
-fn parse_transform_f64(parts: &mut std::str::SplitWhitespace, name: &str) -> Result<f64, String> {
-    let val_str = parts
-        .next()
-        .ok_or_else(|| format!("{}: expected number", name))?;
-    if val_str.contains("..") || val_str.contains('>') {
-        return Err(format!(
-            "{name}: '{val_str}' travels, and audio transforms cannot ramp yet — a filter parameter can only change at a graph rebuild. `vel`, `oct`, `fast`, `slow` and the mini-notation modifiers do ramp."
-        ));
+/// Every value a ramp passes through has to be legal, not only the one it
+/// starts on — the whole travel is played, so the whole travel is checked.
+fn validate_within(name: &str, ramp: &Ramp<f64>, low: f64, high: f64) -> Result<(), String> {
+    for value in ramp.values() {
+        if !value.is_finite() || !(low..=high).contains(&value) {
+            return Err(format!(
+                "{name}: {value} is outside the supported range {low}-{high}"
+            ));
+        }
     }
-    val_str
-        .parse::<f64>()
-        .map_err(|_| format!("{}: invalid number '{}'", name, val_str))
+    Ok(())
+}
+
+/// The half-open case: a cutoff in hertz or a delay time has a floor but no
+/// ceiling this crate is entitled to invent.
+fn validate_at_least(name: &str, ramp: &Ramp<f64>, low: f64) -> Result<(), String> {
+    for value in ramp.values() {
+        if !value.is_finite() || value < low {
+            return Err(format!("{name}: {value} is below the minimum of {low}"));
+        }
+    }
+    Ok(())
 }
 
 // --- Shared helpers ---
@@ -886,10 +944,13 @@ mod tests {
         .unwrap();
         if let SourceLine::Pattern(p) = result {
             assert_eq!(p.transforms.len(), 4);
-            assert_eq!(p.transforms[0], Transform::Gain(0.5));
-            assert_eq!(p.transforms[1], Transform::Lpf(800.0));
-            assert_eq!(p.transforms[2], Transform::Delay(0.25, 0.4, None));
-            assert_eq!(p.transforms[3], Transform::Reverb(0.3));
+            assert_eq!(p.transforms[0], Transform::Gain(Ramp::fixed(0.5)));
+            assert_eq!(p.transforms[1], Transform::Lpf(Ramp::fixed(800.0)));
+            assert_eq!(
+                p.transforms[2],
+                Transform::Delay(Ramp::fixed(0.25), Ramp::fixed(0.4), None)
+            );
+            assert_eq!(p.transforms[3], Transform::Reverb(Ramp::fixed(0.3)));
         } else {
             panic!("expected pattern");
         }
@@ -901,10 +962,13 @@ mod tests {
             parse_line("lead saw \"c4 e4\" | pan -1.0 | vel 0.42 | gain 1.4 | delay 0.2 0.3 0.5")
                 .unwrap();
         if let SourceLine::Pattern(p) = result {
-            assert_eq!(p.transforms[0], Transform::Pan(-1.0));
+            assert_eq!(p.transforms[0], Transform::Pan(Ramp::fixed(-1.0)));
             assert_eq!(p.transforms[1], Transform::Vel(Ramp::fixed(0.42)));
-            assert_eq!(p.transforms[2], Transform::Gain(1.4));
-            assert_eq!(p.transforms[3], Transform::Delay(0.2, 0.3, Some(0.5)));
+            assert_eq!(p.transforms[2], Transform::Gain(Ramp::fixed(1.4)));
+            assert_eq!(
+                p.transforms[3],
+                Transform::Delay(Ramp::fixed(0.2), Ramp::fixed(0.3), Some(Ramp::fixed(0.5)))
+            );
         } else {
             panic!("expected pattern");
         }
@@ -938,14 +1002,17 @@ mod tests {
         assert_eq!(sweep("p pad \"0\" | pan saw 2").wave, LfoWave::Saw);
         assert_eq!(sweep("p pad \"0\" | pan rand 1").wave, LfoWave::Random);
         // Long spellings and mixed case on the suffix both work.
-        assert_eq!(sweep("p pad \"0\" | pan triangle 2HZ").rate, LfoRate::Hertz(2.0));
+        assert_eq!(
+            sweep("p pad \"0\" | pan triangle 2HZ").rate,
+            LfoRate::Hertz(2.0)
+        );
     }
 
     #[test]
     fn test_fixed_pan_still_parses_as_a_position() {
         let result = parse_line("kick kick \"x ~\" | pan -0.3").unwrap();
         if let SourceLine::Pattern(p) = result {
-            assert_eq!(p.transforms[0], Transform::Pan(-0.3));
+            assert_eq!(p.transforms[0], Transform::Pan(Ramp::fixed(-0.3)));
         } else {
             panic!("expected pattern");
         }
@@ -982,8 +1049,8 @@ mod tests {
         assert_eq!(
             call.args,
             vec![
-                FxArg::Positional(FxValue::Plain(0.3)),
-                FxArg::Positional(FxValue::Plain(8.0)),
+                FxArg::Positional(FxValue::Plain(Ramp::fixed(0.3))),
+                FxArg::Positional(FxValue::Plain(Ramp::fixed(8.0))),
             ]
         );
 
@@ -991,8 +1058,8 @@ mod tests {
         assert_eq!(
             call.args,
             vec![
-                FxArg::Named("threshold".into(), FxValue::Plain(0.8)),
-                FxArg::Named("release".into(), FxValue::Plain(0.3)),
+                FxArg::Named("threshold".into(), FxValue::Plain(Ramp::fixed(0.8))),
+                FxArg::Named("release".into(), FxValue::Plain(Ramp::fixed(0.3))),
             ]
         );
 
@@ -1001,8 +1068,8 @@ mod tests {
         assert_eq!(
             call.args,
             vec![
-                FxArg::Positional(FxValue::Plain(0.3)),
-                FxArg::Named("ratio".into(), FxValue::Plain(8.0)),
+                FxArg::Positional(FxValue::Plain(Ramp::fixed(0.3))),
+                FxArg::Named("ratio".into(), FxValue::Plain(Ramp::fixed(8.0))),
             ]
         );
 
@@ -1028,14 +1095,23 @@ mod tests {
     #[test]
     fn test_fx_hz_suffix_is_kept_distinct_from_a_bare_number() {
         let call = fx_call("p pad \"0\" | trem 0.5hz");
-        assert_eq!(call.args, vec![FxArg::Positional(FxValue::Hertz(0.5))]);
+        assert_eq!(
+            call.args,
+            vec![FxArg::Positional(FxValue::Hertz(Ramp::fixed(0.5)))]
+        );
         let call = fx_call("p pad \"0\" | trem 4");
-        assert_eq!(call.args, vec![FxArg::Positional(FxValue::Plain(4.0))]);
+        assert_eq!(
+            call.args,
+            vec![FxArg::Positional(FxValue::Plain(Ramp::fixed(4.0)))]
+        );
         // Mixed case on the suffix too.
         let call = fx_call("p pad \"0\" | fx Tremolo frequency=2HZ");
         assert_eq!(
             call.args,
-            vec![FxArg::Named("frequency".into(), FxValue::Hertz(2.0))]
+            vec![FxArg::Named(
+                "frequency".into(),
+                FxValue::Hertz(Ramp::fixed(2.0))
+            )]
         );
     }
 
@@ -1063,16 +1139,31 @@ mod tests {
                 p.transforms[0],
                 Transform::Vel(Ramp::Sweep { from: 0.4, to: 1.0 })
             );
-            assert_eq!(p.transforms[1], Transform::RampSpan(16));
+            assert_eq!(
+                p.transforms[1],
+                Transform::RampSpan {
+                    cycles: 16,
+                    curve: RampCurve::Linear
+                }
+            );
         } else {
             panic!("expected pattern");
         }
 
         let result = parse_line("p pad \"0\" | oct 0..-2 | fast 1..4 | slow 2..1").unwrap();
         if let SourceLine::Pattern(p) = result {
-            assert_eq!(p.transforms[0], Transform::Oct(Ramp::Sweep { from: 0, to: -2 }));
-            assert_eq!(p.transforms[1], Transform::Fast(Ramp::Sweep { from: 1.0, to: 4.0 }));
-            assert_eq!(p.transforms[2], Transform::Slow(Ramp::Sweep { from: 2.0, to: 1.0 }));
+            assert_eq!(
+                p.transforms[0],
+                Transform::Oct(Ramp::Sweep { from: 0, to: -2 })
+            );
+            assert_eq!(
+                p.transforms[1],
+                Transform::Fast(Ramp::Sweep { from: 1.0, to: 4.0 })
+            );
+            assert_eq!(
+                p.transforms[2],
+                Transform::Slow(Ramp::Sweep { from: 2.0, to: 1.0 })
+            );
         } else {
             panic!("expected pattern");
         }
@@ -1084,9 +1175,18 @@ mod tests {
         if let SourceLine::Pattern(p) = result {
             assert_eq!(
                 p.transforms[0],
-                Transform::Vel(Ramp::Steps { first: 0.3, rest: vec![0.6, 1.0] })
+                Transform::Vel(Ramp::Steps {
+                    first: 0.3,
+                    rest: vec![0.6, 1.0]
+                })
             );
-            assert_eq!(p.transforms[1], Transform::RampSpan(16));
+            assert_eq!(
+                p.transforms[1],
+                Transform::RampSpan {
+                    cycles: 16,
+                    curve: RampCurve::Linear
+                }
+            );
         } else {
             panic!("expected pattern");
         }
@@ -1096,7 +1196,10 @@ mod tests {
         if let SourceLine::Pattern(p) = result {
             assert_eq!(
                 p.transforms[0],
-                Transform::Oct(Ramp::Steps { first: 0, rest: vec![-1, -2] })
+                Transform::Oct(Ramp::Steps {
+                    first: 0,
+                    rest: vec![-1, -2]
+                })
             );
         } else {
             panic!("expected pattern");
@@ -1114,24 +1217,194 @@ mod tests {
         assert!(error.contains("more than two ends"), "{error}");
     }
 
+    fn transforms(source: &str) -> Vec<Transform> {
+        match parse_line(source).unwrap() {
+            SourceLine::Pattern(p) => p.transforms,
+            other => panic!("expected a pattern, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn test_an_audio_transform_rejects_a_step_chain_too() {
-        let error = parse_line("p pad \"0\" | lpf 300>900>2000").unwrap_err();
-        assert!(error.contains("cannot ramp yet"), "{error}");
+    fn test_audio_transforms_take_ranges() {
+        // The line the engine's sweep mechanism exists for.
+        assert_eq!(
+            transforms("p pad \"0\" | lpf 300..9000 | ramp 16"),
+            vec![
+                Transform::Lpf(Ramp::Sweep {
+                    from: 300.0,
+                    to: 9000.0
+                }),
+                Transform::RampSpan {
+                    cycles: 16,
+                    curve: RampCurve::Linear
+                },
+            ]
+        );
+
+        assert_eq!(
+            transforms("p pad \"0\" | hpf 40>200>800"),
+            vec![Transform::Hpf(Ramp::Steps {
+                first: 40.0,
+                rest: vec![200.0, 800.0]
+            })]
+        );
+        assert_eq!(
+            transforms("p pad \"0\" | gain 0.2..1.0"),
+            vec![Transform::Gain(Ramp::Sweep { from: 0.2, to: 1.0 })]
+        );
+        assert_eq!(
+            transforms("p pad \"0\" | reverb 0.0..0.6"),
+            vec![Transform::Reverb(Ramp::Sweep { from: 0.0, to: 0.6 })]
+        );
+        // A fixed position that travels, still told apart from a waveform.
+        assert_eq!(
+            transforms("p pad \"0\" | pan -0.8..0.8"),
+            vec![Transform::Pan(Ramp::Sweep {
+                from: -0.8,
+                to: 0.8
+            })]
+        );
+        // All three of delay's numbers travel independently.
+        assert_eq!(
+            transforms("p pad \"0\" | delay 0.1..0.4 0.2>0.6 0.3..0.9"),
+            vec![Transform::Delay(
+                Ramp::Sweep { from: 0.1, to: 0.4 },
+                Ramp::Steps {
+                    first: 0.2,
+                    rest: vec![0.6]
+                },
+                Some(Ramp::Sweep { from: 0.3, to: 0.9 }),
+            )]
+        );
+    }
+
+    #[test]
+    fn test_fx_arguments_take_ranges() {
+        // `hz` still marks an absolute frequency, range or not.
+        let call = fx_call("p pad \"0\" | trem 2..8hz 0.7");
+        assert_eq!(
+            call.args,
+            vec![
+                FxArg::Positional(FxValue::Hertz(Ramp::Sweep { from: 2.0, to: 8.0 })),
+                FxArg::Positional(FxValue::Plain(Ramp::fixed(0.7))),
+            ]
+        );
+        let FxArg::Positional(ref rate) = call.args[0] else {
+            panic!("expected a positional argument");
+        };
+        assert!(rate.travels(), "a ranged fx argument needs a ramp span");
+        assert!(!matches!(&call.args[1], FxArg::Positional(v) if v.travels()));
+
+        let call = fx_call("p pad \"0\" | fx Tremolo depth=0.2>0.9");
+        assert_eq!(
+            call.args,
+            vec![FxArg::Named(
+                "depth".into(),
+                FxValue::Plain(Ramp::Steps {
+                    first: 0.2,
+                    rest: vec![0.9]
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn test_travels_reports_on_every_ranged_argument() {
+        let fixed = transforms("p pad \"0\" | lpf 900");
+        assert_eq!(fixed, vec![Transform::Lpf(Ramp::fixed(900.0))]);
+        let Transform::Lpf(ref cutoff) = fixed[0] else {
+            panic!("expected lpf");
+        };
+        assert!(!cutoff.travels(), "a plain value must not ask for a ramp");
+
+        let swept = transforms("p pad \"0\" | lpf 300..9000");
+        let Transform::Lpf(ref cutoff) = swept[0] else {
+            panic!("expected lpf");
+        };
+        assert!(cutoff.travels());
+        assert_eq!(cutoff.start(), 300.0);
+        assert_eq!(cutoff.values(), vec![300.0, 9000.0]);
+    }
+
+    #[test]
+    fn test_every_value_of_an_audio_range_is_validated() {
+        // The far end of the travel is played too, so it is checked too.
+        let error = parse_line("p pad \"0\" | reverb 0.5..1.4").unwrap_err();
+        assert!(error.contains("1.4"), "{error}");
+        assert!(error.contains("0-1"), "{error}");
+
+        assert!(
+            parse_line("p pad \"0\" | gain 0.5>1.0>2.5")
+                .unwrap_err()
+                .contains("2.5")
+        );
+        assert!(
+            parse_line("p pad \"0\" | pan -0.5..1.5")
+                .unwrap_err()
+                .contains("1.5")
+        );
+        assert!(
+            parse_line("p pad \"0\" | vel 0.4..1.2")
+                .unwrap_err()
+                .contains("1.2")
+        );
+        assert!(
+            parse_line("p pad \"0\" | delay 0.2 0.4..1.0")
+                .unwrap_err()
+                .contains("delay feedback")
+        );
+        assert!(
+            parse_line("p pad \"0\" | lpf 900..-20")
+                .unwrap_err()
+                .contains("below the minimum")
+        );
+        // A filter's own limits stay the consumer's business (§4.5), so a wild
+        // `fx` argument is not rejected here.
+        assert!(parse_line("p pad \"0\" | trem 0..900").is_ok());
     }
 
     #[test]
     fn test_ramp_span_must_be_at_least_one_cycle() {
-        assert!(parse_line("p pad \"0\" | ramp 0").unwrap_err().contains("at least one cycle"));
-        assert!(parse_line("p pad \"0\" | ramp").unwrap_err().contains("expected a number"));
+        assert!(
+            parse_line("p pad \"0\" | ramp 0")
+                .unwrap_err()
+                .contains("at least one cycle")
+        );
+        assert!(
+            parse_line("p pad \"0\" | ramp")
+                .unwrap_err()
+                .contains("expected a number")
+        );
     }
 
     #[test]
-    fn test_an_audio_transform_given_a_range_says_what_does_ramp() {
-        let error = parse_line("p pad \"0\" | lpf 300..9000").unwrap_err();
-        assert!(error.contains("cannot ramp yet"), "{error}");
-        // The message has to point at something that works.
-        assert!(error.contains("vel"), "{error}");
+    fn test_ramp_span_carries_a_curve() {
+        // Omitted means linear, so old buffers keep their meaning.
+        assert_eq!(
+            transforms("p pad \"0\" | lpf 300..9000 | ramp 16"),
+            transforms("p pad \"0\" | lpf 300..9000 | ramp 16 lin")
+        );
+        assert_eq!(
+            transforms("p pad \"0\" | ramp 8 exp"),
+            vec![Transform::RampSpan {
+                cycles: 8,
+                curve: RampCurve::Exponential
+            }]
+        );
+        assert_eq!(RampCurve::default(), RampCurve::Linear);
+    }
+
+    #[test]
+    fn test_ramp_curve_errors_are_specific() {
+        let error = parse_line("p pad \"0\" | ramp 8 sine").unwrap_err();
+        assert!(error.contains("'sine' is not a curve"), "{error}");
+        assert!(error.contains("lin") && error.contains("exp"), "{error}");
+        // The arity is still fixed: one curve, not two.
+        assert!(
+            parse_line("p pad \"0\" | ramp 8 exp lin")
+                .unwrap_err()
+                .contains("unexpected argument")
+        );
     }
 
     #[test]

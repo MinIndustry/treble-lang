@@ -237,11 +237,17 @@ lead bass \"0 3 5 3\"";
         );
         assert!(!parse_program("group a {\nbpm 130\n}").1.is_empty());
         assert!(
-            !parse_program("group a {\ndef x { tone sine }\n}").1.is_empty(),
+            !parse_program("group a {\ndef x { tone sine }\n}")
+                .1
+                .is_empty(),
             "defs must not live inside groups"
         );
         // Header must end with the brace; members go on their own lines.
-        assert!(!parse_program("group drums { kick kick \"x\" }").1.is_empty());
+        assert!(
+            !parse_program("group drums { kick kick \"x\" }")
+                .1
+                .is_empty()
+        );
     }
 
     #[test]

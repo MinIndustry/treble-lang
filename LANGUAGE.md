@@ -454,7 +454,7 @@ Available transforms:
 | `scale <root> <mode>`  | Quantise to scale (overrides global)           |
 | `oct <offset>`         | Shift octave by offset (signed integer)        |
 | `vel <amount>`         | Note velocity (float, 0.0–1.0)                 |
-| `ramp <cycles>`        | How long the line's ranges take to travel (§4.6) |
+| `ramp <cycles> [lin\|exp]` | How long the line's ranges take to travel, and how (§4.6) |
 | `gain <amount>`        | Output level (float, 0.0–2.0)                  |
 | `pan <position>`       | Fixed stereo position (-1.0 left – 1.0 right)  |
 | `pan <wave> <rate> [depth]` | Stereo position swept by an LFO (§4.4)    |
@@ -463,6 +463,12 @@ Available transforms:
 | `delay <time> <fb> [mix]` | Delay (seconds, feedback 0–0.99, wet mix 0–1, default 0.35) |
 | `reverb <amount>`      | Reverb mix (float, 0.0–1.0)                    |
 | `fx <filter> <arg>...` | Any engine filter, by name (§4.5)              |
+
+Every numeric argument in this table may be a **range** instead of a single
+value, travelling across the line's `ramp` span (§4.6) — `| lpf 300..9000 |
+ramp 16` opens a filter over sixteen cycles. The exceptions are the arities and
+the non-numeric arguments: `every`'s cycle count, `ramp`'s own span, `arp`'s
+mode, `scale`'s root and mode, and a swept pan's waveform, rate and depth.
 
 Transforms split into two families:
 
@@ -527,7 +533,7 @@ pad pad "0 _" | fx Compressor 0.3 8
 
     fx_call = ( "fx" filter | alias ) { fx_arg } ;
     fx_arg  = value | name "=" value ;
-    value   = signed_number [ "hz" ] ;
+    value   = range [ "hz" ] ;              (* range: §4.6 *)
     alias   = "trem" | "bpf" | "rbpf" | "avg" | "clip" | "comp" | "limit" ;
 
 Positional arguments fill the filter's declared parameters in order; a named
@@ -558,9 +564,9 @@ sn snare "x(4..16,4)"    | vel 0.4..1.0      | ramp 8   -- sweeps
 sn snare "x(2>4>8>16,4)" | vel 0.3>0.6>1.0   | ramp 16  -- steps
 ```
 
-    range = number
-          | number ".." number          (* sweeps continuously *)
-          | number ( ">" number )+ ;    (* holds each stage *)
+    range = signed_number
+          | signed_number ".." signed_number         (* sweeps continuously *)
+          | signed_number ( ">" signed_number )+ ;   (* holds each stage *)
 
 `a..b` moves continuously and passes through every value between the ends.
 `a>b>c` holds each stage for an **equal share** of the span and passes through
@@ -572,20 +578,65 @@ Mixing the two spellings in one value is an error, as is giving `..` more than
 two ends.
 
 One `ramp` covers every range on the line, because a build usually moves several
-things over the same span. Ranges are accepted on the `vel`, `oct`, `fast` and
-`slow` transforms, and on the `*N`, `(onsets,positions)` and `?p` mini-notation
-modifiers.
+things over the same span. Ranges are accepted on:
+
+- the event transforms `vel`, `oct`, `fast` and `slow`;
+- the audio transforms `gain`, `pan` (the fixed position), `lpf`, `hpf`,
+  `reverb`, and all three numbers of `delay` — so `| lpf 300..9000 | ramp 16`
+  is a filter opening over sixteen cycles;
+- the numeric arguments of `fx` and its aliases, positional or named, with or
+  without an `hz` suffix: `| trem 2..8hz 0.7`;
+- the mini-notation modifiers `*N`, `(onsets,positions)` and `?p`, the `:v`
+  velocity suffix (§3.17), and `solo`'s step count.
 
 A range without a `ramp`, or a `ramp` with nothing to move, is an authoring
 mistake and should be reported rather than guessed at.
+
+Each end and each stage of a range must be a legal value for the thing it is
+written on — the whole travel has to be playable, not only where it starts, so
+`| reverb 0.5..1.4` is rejected on its far end.
 
 **Holding, not looping.** A ramp arrives and stays until the line changes; that
 is what makes it a crescendo rather than a repeating sweep. Consumers should
 measure travel from the cycle the line was last added or modified, so editing one
 line does not restart another line's build.
 
-Audio transforms (§4.3) cannot take ranges: a filter parameter only changes when
-the graph is rebuilt.
+An audio transform's range still means rebuilding what the graph needs to sweep
+that parameter; the language only states the intent.
+
+#### 4.6.1 The curve: `ramp <cycles> [lin|exp]`
+
+    ramp_span  = "ramp" integer [ ramp_curve ] ;
+    ramp_curve = "lin" | "exp" ;
+
+```
+lead saw "0 3 5" | lpf 300..9000 | ramp 16        -- linear, the default
+lead saw "0 3 5" | lpf 300..9000 | ramp 16 exp    -- even in perceived pitch
+```
+
+`lin` moves in equal value steps and is the default when the curve is omitted,
+so every buffer written before curves existed keeps its meaning exactly.
+
+`exp` moves in equal **ratio** steps — geometric interpolation. It exists
+because linear travel is audibly wrong for anything perceived logarithmically:
+a linear sweep from 300 Hz to 9 kHz is past 4.5 kHz at the halfway point and
+spends most of the span sounding "already open", while a geometric one crosses
+1.6 kHz there and sounds like a steady opening. The same goes for delay times
+and, arguably, for gain.
+
+One `ramp` governs every range on the line — there are no per-value curves.
+A build moves several parameters together and wants them to arrive together;
+per-value curves would also make the line unreadable at performance speed.
+
+`exp` applies to the sweep spelling (`a..b`); a step chain (`a>b>c`) already
+names each value it holds, so the curve does not change what it plays.
+
+**Interpreting `exp` is the consumer's job.** This crate records the intent and
+nothing more. Two things the consumer decides, because they depend on the
+parameter rather than on the notation: what to do with a range that touches or
+crosses zero (geometric interpolation is undefined there — falling back to
+linear travel for that value is the sane reading), and whether a value it treats
+as an integer count is rounded on the way.
 
 ### 4.7 Muting
 
@@ -852,8 +903,10 @@ The group pipe takes **audio transforms** — `gain`, `pan` (fixed or swept),
 a filter: it multiplies into every member's velocity. Event transforms
 (`rev`, `fast`, `slow`, `every`, `arp`, `oct`, `scale`) shape individual
 patterns and are rejected on a group; write them on the member lines.
-Ranges are also rejected: bus filter parameters only change at graph
-rebuilds, so `| ramp` on a group is an error for now.
+Ranges are also rejected on a group, even though a pattern line accepts them
+(§4.6): a bus serves several lines that were added and edited at different
+cycles, so there is no one cycle to measure the travel from. `| ramp` on a
+group is an error for now.
 
 ### 7.3 Muting and mixing
 
@@ -956,23 +1009,30 @@ instrument    = identifier ;
 identifier    = letter { letter | digit | "_" } ;
 
 transform     = "rev"
-              | "fast" number
-              | "slow" number
+              | "fast" range
+              | "slow" range
               | "every" integer transform
               | "arp" arp_mode
               | "scale" pitch_root scale_mode
-              | "oct" signed_integer
-              | "vel" number
-              | "gain" number
-              | "pan" signed_number
+              | "oct" range
+              | "vel" range
+              | "ramp" integer [ ramp_curve ]
+              | "gain" range
+              | "pan" range
               | "pan" lfo_wave lfo_rate [ number ]
               | fx_call
-              | "lpf" number
-              | "hpf" number
-              | "delay" number number [ number ]
-              | "reverb" number ;
+              | "lpf" range
+              | "hpf" range
+              | "delay" range range [ range ]
+              | "reverb" range ;
 
 arp_mode      = "up" | "down" | "updown" | "random" ;
+
+(* A value that travels across the line's ramp span — §4.6. *)
+range         = signed_number
+              | signed_number ".." signed_number
+              | signed_number { ">" signed_number } ;
+ramp_curve    = "lin" | "exp" ;   (* omitted = "lin" *)
 
 lfo_wave      = "sine" | "sin" | "tri" | "triangle"
               | "sq" | "square" | "saw" | "rand" | "random" ;
@@ -980,16 +1040,18 @@ lfo_rate      = number [ "hz" ] ;   (* bare = cycles per sweep *)
 
 fx_call       = ( "fx" identifier | fx_alias ) { fx_arg } ;
 fx_arg        = fx_value | identifier "=" fx_value ;
-fx_value      = signed_number [ "hz" ] ;
+fx_value      = range [ "hz" ] ;
 fx_alias      = "trem" | "bpf" | "rbpf" | "avg"
               | "clip" | "comp" | "limit" ;
 
 (* Mini-notation grammar — contents of string_literal *)
 mini          = sequence ;
 sequence      = step { whitespace step } ;
-step          = atom { modifier } ;
-atom          = note | degree | trigger | rest | hold
-              | group | alternation ;
+(* At most one velocity per step, written anywhere among the modifiers — §3.17.
+   `accent` is shorthand for velocity 1.0, so `X` and `x:1.0` are one thing. *)
+step          = atom { modifier | velocity } ;
+atom          = note | degree | trigger | accent | rest | hold
+              | group | alternation | solo ;
 group         = "[" ( chord | choice ) "]" ;
 alternation   = "<" sequence ">" ;
 chord         = sequence { "," sequence } ;
