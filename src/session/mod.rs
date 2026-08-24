@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{PatternDef, PitchRoot, Program, ScaleMode, SourceLine};
+use crate::ast::{GroupDef, InstrumentDef, PatternDef, PitchRoot, Program, ScaleMode, SourceLine};
 use crate::error::CompileError;
 use crate::parser::parse_program;
 
@@ -24,6 +24,26 @@ pub enum Delta {
     Mute(String),
     /// A pattern was unmuted.
     Unmute(String),
+    /// A `def` instrument was added.
+    AddInstrument(String),
+    /// A `def` instrument's definition changed.
+    ModifyInstrument(String),
+    /// A `def` instrument was removed from the buffer.
+    RemoveInstrument(String),
+    /// A group was added.
+    AddGroup(String),
+    /// A group's members, filters, or mute flag changed.
+    ModifyGroup(String),
+    /// A group was removed.
+    RemoveGroup(String),
+    /// A `load "<path>"` needs resolving: the path is new to the buffer, or the
+    /// order of the `load` lines changed and with it which file wins a name.
+    ///
+    /// This crate does no I/O, so it cannot see a loaded file change on disk; a
+    /// consumer watching the file raises this same delta for that case (§8.2).
+    Load(String),
+    /// A `load` line left the buffer, so its definitions go with it.
+    Unload(String),
 }
 
 /// Result returned by [`Session::evaluate`].
@@ -38,6 +58,19 @@ pub struct EvalResult {
     pub patterns_muted: usize,
 }
 
+fn group_error(line: usize, message: String) -> CompileError {
+    CompileError {
+        kind: crate::error::CompileErrorKind::ParseError,
+        location: crate::error::SourceLocation {
+            line,
+            column: 1,
+            file: None,
+        },
+        message,
+        suggestion: None,
+    }
+}
+
 /// Live session state.
 #[derive(Clone)]
 pub struct Session {
@@ -45,10 +78,20 @@ pub struct Session {
     pub bpm: u32,
     /// Current time signature (numerator, denominator).
     pub sig: (u8, u8),
+    /// How many cycles a phrase spans. Changes are quantised to it, so `1` is
+    /// "apply at the next cycle" and `16` is "apply at the top of the phrase".
+    pub phrase: u32,
     /// Default scale for degree patterns (`scale` directive).
     pub scale: Option<(PitchRoot, ScaleMode)>,
     /// Active patterns by name.
     patterns: HashMap<String, PatternDef>,
+    /// Instruments defined in the buffer by `def`, by name.
+    definitions: HashMap<String, InstrumentDef>,
+    /// Instrument groups by name.
+    groups: HashMap<String, GroupDef>,
+    /// `load` paths in buffer order — the order decides which of two files wins
+    /// a name (§2.5), so it is kept rather than reduced to a set.
+    loads: Vec<String>,
     /// Pending deltas (queued for next loop boundary).
     pending: Vec<Delta>,
     /// Last successfully parsed program (for diffing).
@@ -60,8 +103,12 @@ impl Session {
         Self {
             bpm: 120,
             sig: (4, 4),
+            phrase: 1,
             scale: None,
             patterns: HashMap::new(),
+            definitions: HashMap::new(),
+            groups: HashMap::new(),
+            loads: Vec::new(),
             pending: Vec::new(),
             last_program: None,
         }
@@ -86,32 +133,91 @@ impl Session {
         // Extract state from the new program
         let mut new_bpm = self.bpm;
         let mut new_sig = self.sig;
+        let mut new_phrase = self.phrase;
         let mut new_scale = self.scale;
         let mut new_patterns: HashMap<String, PatternDef> = HashMap::new();
+        let mut new_definitions: HashMap<String, InstrumentDef> = HashMap::new();
+        let mut new_groups: HashMap<String, GroupDef> = HashMap::new();
+        let mut new_loads: Vec<String> = Vec::new();
+        // The open group's name and mute flag while walking the lines; the
+        // parser has already verified pairing, so this only pairs the header
+        // with its `}` transforms.
+        let mut open_group: Option<(String, bool)> = None;
+        let mut group_errors: Vec<CompileError> = Vec::new();
 
-        for line in &program.lines {
+        for (line_idx, line) in program.lines.iter().enumerate() {
             match line {
                 SourceLine::Bpm(val) => new_bpm = *val,
                 SourceLine::Sig(num, den) => new_sig = (*num, *den),
+                SourceLine::Phrase(cycles) => new_phrase = *cycles,
                 SourceLine::Scale(root, mode) => new_scale = Some((*root, *mode)),
+                SourceLine::Load(path) => new_loads.push(path.clone()),
                 SourceLine::Pattern(def) => {
                     new_patterns.insert(def.name.clone(), def.clone());
+                }
+                SourceLine::Def(definition) => {
+                    new_definitions.insert(definition.name.clone(), (**definition).clone());
+                }
+                SourceLine::GroupStart { muted, name } => {
+                    if new_groups.contains_key(name) {
+                        group_errors.push(group_error(
+                            line_idx + 1,
+                            format!("group '{name}' is declared twice"),
+                        ));
+                    }
+                    open_group = Some((name.clone(), *muted));
+                }
+                SourceLine::GroupEnd(transforms) => {
+                    if let Some((name, muted)) = open_group.take() {
+                        new_groups.insert(
+                            name.clone(),
+                            GroupDef {
+                                muted,
+                                name,
+                                transforms: transforms.clone(),
+                            },
+                        );
+                    }
                 }
                 _ => {}
             }
         }
+        // A group and a pattern sharing a name would collide in the mixer.
+        for name in new_groups.keys() {
+            if new_patterns.contains_key(name) {
+                group_errors.push(group_error(
+                    1,
+                    format!("'{name}' names both a group and a pattern; pick two names"),
+                ));
+            }
+        }
+        if !group_errors.is_empty() {
+            return EvalResult {
+                errors: group_errors,
+                deltas: Vec::new(),
+                patterns_active: self.patterns.values().filter(|p| !p.muted).count(),
+                patterns_muted: self.patterns.values().filter(|p| p.muted).count(),
+            };
+        }
 
         // Compute deltas
-        let deltas = self.diff(&new_patterns);
+        let mut deltas = self.diff(&new_patterns);
+        deltas.extend(self.diff_definitions(&new_definitions));
+        deltas.extend(self.diff_groups(&new_groups));
+        deltas.extend(self.diff_loads(&new_loads));
 
         // Apply immediate directives
         self.bpm = new_bpm;
         self.sig = new_sig;
+        self.phrase = new_phrase;
         self.scale = new_scale;
 
         // Update pattern state
         self.pending = deltas.clone();
         self.patterns = new_patterns;
+        self.definitions = new_definitions;
+        self.groups = new_groups;
+        self.loads = new_loads;
         self.last_program = Some(program);
 
         let patterns_active = self.patterns.values().filter(|p| !p.muted).count();
@@ -155,6 +261,85 @@ impl Session {
         deltas
     }
 
+    /// Diff `def` blocks against current state.
+    fn diff_definitions(&self, new_definitions: &HashMap<String, InstrumentDef>) -> Vec<Delta> {
+        let mut deltas = Vec::new();
+        for (name, definition) in new_definitions {
+            match self.definitions.get(name) {
+                None => deltas.push(Delta::AddInstrument(name.clone())),
+                Some(previous) if previous != definition => {
+                    deltas.push(Delta::ModifyInstrument(name.clone()));
+                }
+                Some(_) => {}
+            }
+        }
+        for name in self.definitions.keys() {
+            if !new_definitions.contains_key(name) {
+                deltas.push(Delta::RemoveInstrument(name.clone()));
+            }
+        }
+        deltas
+    }
+
+    fn diff_groups(&self, new_groups: &HashMap<String, GroupDef>) -> Vec<Delta> {
+        let mut deltas = Vec::new();
+        for (name, group) in new_groups {
+            match self.groups.get(name) {
+                None => deltas.push(Delta::AddGroup(name.clone())),
+                Some(previous) if previous != group => {
+                    deltas.push(Delta::ModifyGroup(name.clone()));
+                }
+                Some(_) => {}
+            }
+        }
+        for name in self.groups.keys() {
+            if !new_groups.contains_key(name) {
+                deltas.push(Delta::RemoveGroup(name.clone()));
+            }
+        }
+        deltas
+    }
+
+    /// Diff `load` paths against current state.
+    ///
+    /// A path is compared by the text the performer wrote, not by a resolved
+    /// filename: resolution is the consumer's (§2.5), and it is the only side
+    /// that can tell two spellings of one file apart.
+    fn diff_loads(&self, new_loads: &[String]) -> Vec<Delta> {
+        let mut deltas = Vec::new();
+        for path in new_loads {
+            if !self.loads.contains(path) {
+                deltas.push(Delta::Load(path.clone()));
+            }
+        }
+        for path in self.loads.iter() {
+            if !new_loads.contains(path) {
+                deltas.push(Delta::Unload(path.clone()));
+            }
+        }
+        // A pure reorder changes which file wins a name, so the whole set has
+        // to be resolved again even though nothing was added or removed.
+        if deltas.is_empty() && self.loads != new_loads {
+            deltas.extend(new_loads.iter().cloned().map(Delta::Load));
+        }
+        deltas
+    }
+
+    /// `load` paths in the buffer, in the order they were written.
+    pub fn loads(&self) -> &[String] {
+        &self.loads
+    }
+
+    /// Instruments defined in the buffer, by name.
+    pub fn definitions(&self) -> &HashMap<String, InstrumentDef> {
+        &self.definitions
+    }
+
+    /// Instrument groups in the buffer, by name.
+    pub fn groups(&self) -> &HashMap<String, GroupDef> {
+        &self.groups
+    }
+
     /// Get the currently pending deltas.
     pub fn pending_deltas(&self) -> &[Delta] {
         &self.pending
@@ -190,6 +375,68 @@ impl Default for Session {
 mod tests {
     use super::*;
     use crate::ast::{Accidental, NoteLetter, PitchRoot, ScaleMode};
+
+    #[test]
+    fn test_groups_are_tracked_and_diffed() {
+        let mut session = Session::new();
+        let source = "group drums {\nkick kick \"x ~\"\n} | lpf 800";
+        let result = session.evaluate(source);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.deltas.contains(&Delta::AddGroup("drums".into())));
+        let group = &session.groups()["drums"];
+        assert!(!group.muted);
+        assert_eq!(group.transforms.len(), 1);
+
+        // Changing the shared chain is a modify; dropping the block a remove.
+        let result = session.evaluate("group drums {\nkick kick \"x ~\"\n} | lpf 400");
+        assert!(result.deltas.contains(&Delta::ModifyGroup("drums".into())));
+        let result = session.evaluate("kick kick \"x ~\"");
+        assert!(result.deltas.contains(&Delta::RemoveGroup("drums".into())));
+        assert!(session.groups().is_empty());
+    }
+
+    #[test]
+    fn test_group_name_collisions_are_rejected() {
+        let mut session = Session::new();
+        let twice = "group a {\nkick kick \"x\"\n}\ngroup a {\nsn snare \"x\"\n}";
+        assert!(!session.evaluate(twice).errors.is_empty());
+        let shadowing = "group kick {\nkick kick \"x\"\n}";
+        assert!(!session.evaluate(shadowing).errors.is_empty());
+        // A failed evaluation must not poison the session.
+        assert!(session.groups().is_empty());
+    }
+
+    #[test]
+    fn test_loads_are_tracked_and_diffed() {
+        let mut session = Session::new();
+        let result = session.evaluate("load \"pads.trbl\"\nkick kick \"x ~\"");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.deltas.contains(&Delta::Load("pads.trbl".into())));
+        assert_eq!(session.loads(), ["pads.trbl"]);
+
+        // Unchanged buffer, nothing to resolve again.
+        let result = session.evaluate("load \"pads.trbl\"\nkick kick \"x ~\"");
+        assert!(result.deltas.is_empty(), "{:?}", result.deltas);
+
+        // A second file is one new load, not a re-resolve of both.
+        let result = session.evaluate("load \"pads.trbl\"\nload \"keys.trbl\"\nkick kick \"x ~\"");
+        assert_eq!(result.deltas, vec![Delta::Load("keys.trbl".into())]);
+
+        // Swapping the order changes which file wins a name, so both reload.
+        let result = session.evaluate("load \"keys.trbl\"\nload \"pads.trbl\"\nkick kick \"x ~\"");
+        assert_eq!(
+            result.deltas,
+            vec![
+                Delta::Load("keys.trbl".into()),
+                Delta::Load("pads.trbl".into())
+            ]
+        );
+
+        let result = session.evaluate("kick kick \"x ~\"");
+        assert!(result.deltas.contains(&Delta::Unload("pads.trbl".into())));
+        assert!(result.deltas.contains(&Delta::Unload("keys.trbl".into())));
+        assert!(session.loads().is_empty());
+    }
 
     #[test]
     fn test_session_initial_state() {
