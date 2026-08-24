@@ -636,8 +636,10 @@ fn ramp_from_text<T: Copy>(
 fn validate_within(name: &str, ramp: &Ramp<f64>, low: f64, high: f64) -> Result<(), String> {
     for value in ramp.values() {
         if !value.is_finite() || !(low..=high).contains(&value) {
+            // "{low} to {high}" rather than a hyphen: a negative bound would
+            // make `pan: -2 is outside the supported range -1-1`.
             return Err(format!(
-                "{name}: {value} is outside the supported range {low}-{high}"
+                "{name}: {value} is outside the supported range {low} to {high}"
             ));
         }
     }
@@ -1331,7 +1333,7 @@ mod tests {
         // The far end of the travel is played too, so it is checked too.
         let error = parse_line("p pad \"0\" | reverb 0.5..1.4").unwrap_err();
         assert!(error.contains("1.4"), "{error}");
-        assert!(error.contains("0-1"), "{error}");
+        assert!(error.contains("0 to 1"), "{error}");
 
         assert!(
             parse_line("p pad \"0\" | gain 0.5>1.0>2.5")
