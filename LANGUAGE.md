@@ -101,15 +101,46 @@ Root is a pitch name (see §3.1) without octave. Mode is one of:
 
 ### 2.5 `load "<filepath>"`
 
-Load instrument definitions from an external file.
+Load instrument definitions from an external file, so a performance can carry
+its own instrument dependencies and a buffer stays portable between machines.
 
 ```
-load "pads.rt"
-load "instruments/wobble.rt"
+load "pads.trbl"
+load "instruments/wobble.trbl"
 ```
 
-The path is relative to the current file. Only `def` blocks (see §6) are
-extracted from loaded files.
+**Resolution order.** The path is tried in exactly two places, in order:
+
+1. relative to the directory of the buffer being evaluated;
+2. the user's instrument library directory.
+
+The first hit wins. An absolute path is used as written. Nothing else is
+searched — no ambient path variable, no working directory — so a buffer that
+loads on one machine loads on the next as long as the file travels with it or
+lives in the library.
+
+**What a loaded file may contain.** A loaded file (`.trbl` by convention) holds
+`def` blocks (§6) and nothing that sounds: pattern lines, directives and
+`group` blocks in it are an error rather than silently ignored, because a file
+of instruments that quietly started a pattern would be impossible to reason
+about mid-performance.
+
+**Precedence.** A name defined in the buffer wins over the same name loaded
+from a file, so a local `def` is always the definition you are editing. Between
+two loaded files, the later `load` line wins.
+
+**Loads do not recurse.** A `load` line inside a loaded file is an error. That
+keeps evaluation bounded and makes import cycles impossible to write, at the
+cost of having to list the files a performance needs in the performance itself
+— which is also what makes the dependency list visible.
+
+**A missing or invalid file is an evaluation error**, reported per-line like any
+other, and the previous state keeps sounding (§8.3). A `load` never silences a
+performance.
+
+Resolving the path is the consumer's job — this crate does no I/O and records
+the path exactly as written. The rules above are the contract it resolves
+against.
 
 ---
 
@@ -1007,6 +1038,8 @@ against the current live state. Changes are **queued** and applied at the next
 | Unmuted pattern              | Resumes at next loop boundary       |
 | Directive change             | Applies immediately (except `sig`)  |
 | `sig` change                 | Applies at next loop boundary       |
+| New or changed `load`        | Definitions swap at next loop boundary |
+| Removed `load`               | Its definitions leave at next loop boundary |
 
 ### 8.2 Diffing Rules
 
@@ -1016,6 +1049,13 @@ The session tracks patterns by **name**. After parsing:
 - If a name exists in the old source but not the new: **removed**.
 - If a name exists in both but the pattern content changed: **modified**.
 - If a name exists in both with identical content: **unchanged** (no action).
+
+`def` blocks and `group` blocks diff by name the same way. `load` lines diff by
+**path**: a path new to the buffer, or one whose file has changed on disk since
+it was resolved, is a load to (re)resolve; a path no longer in the buffer
+unloads its definitions. Only the consumer can see a file change, since this
+crate does no I/O — the session raises the load when the buffer's set of paths
+changes and the consumer raises it again when it notices the file itself move.
 
 ### 8.3 Error Handling
 
@@ -1041,6 +1081,7 @@ The session maintains:
 | `sig`                | `(u8, u8)`              | Time signature           |
 | `scale`              | `Option<(Root, Mode)>`  | Default scale            |
 | `patterns`           | `Map<Name, Pattern>`    | Active patterns          |
+| `loads`              | `Set<Path>`             | `load` paths in the buffer |
 | `pending`            | `Vec<Delta>`            | Queued changes           |
 | `beat_position`      | `f64`                   | Current beat in cycle    |
 

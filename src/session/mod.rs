@@ -36,6 +36,14 @@ pub enum Delta {
     ModifyGroup(String),
     /// A group was removed.
     RemoveGroup(String),
+    /// A `load "<path>"` needs resolving: the path is new to the buffer, or the
+    /// order of the `load` lines changed and with it which file wins a name.
+    ///
+    /// This crate does no I/O, so it cannot see a loaded file change on disk; a
+    /// consumer watching the file raises this same delta for that case (§8.2).
+    Load(String),
+    /// A `load` line left the buffer, so its definitions go with it.
+    Unload(String),
 }
 
 /// Result returned by [`Session::evaluate`].
@@ -81,6 +89,9 @@ pub struct Session {
     definitions: HashMap<String, InstrumentDef>,
     /// Instrument groups by name.
     groups: HashMap<String, GroupDef>,
+    /// `load` paths in buffer order — the order decides which of two files wins
+    /// a name (§2.5), so it is kept rather than reduced to a set.
+    loads: Vec<String>,
     /// Pending deltas (queued for next loop boundary).
     pending: Vec<Delta>,
     /// Last successfully parsed program (for diffing).
@@ -97,6 +108,7 @@ impl Session {
             patterns: HashMap::new(),
             definitions: HashMap::new(),
             groups: HashMap::new(),
+            loads: Vec::new(),
             pending: Vec::new(),
             last_program: None,
         }
@@ -126,6 +138,7 @@ impl Session {
         let mut new_patterns: HashMap<String, PatternDef> = HashMap::new();
         let mut new_definitions: HashMap<String, InstrumentDef> = HashMap::new();
         let mut new_groups: HashMap<String, GroupDef> = HashMap::new();
+        let mut new_loads: Vec<String> = Vec::new();
         // The open group's name and mute flag while walking the lines; the
         // parser has already verified pairing, so this only pairs the header
         // with its `}` transforms.
@@ -138,6 +151,7 @@ impl Session {
                 SourceLine::Sig(num, den) => new_sig = (*num, *den),
                 SourceLine::Phrase(cycles) => new_phrase = *cycles,
                 SourceLine::Scale(root, mode) => new_scale = Some((*root, *mode)),
+                SourceLine::Load(path) => new_loads.push(path.clone()),
                 SourceLine::Pattern(def) => {
                     new_patterns.insert(def.name.clone(), def.clone());
                 }
@@ -190,6 +204,7 @@ impl Session {
         let mut deltas = self.diff(&new_patterns);
         deltas.extend(self.diff_definitions(&new_definitions));
         deltas.extend(self.diff_groups(&new_groups));
+        deltas.extend(self.diff_loads(&new_loads));
 
         // Apply immediate directives
         self.bpm = new_bpm;
@@ -202,6 +217,7 @@ impl Session {
         self.patterns = new_patterns;
         self.definitions = new_definitions;
         self.groups = new_groups;
+        self.loads = new_loads;
         self.last_program = Some(program);
 
         let patterns_active = self.patterns.values().filter(|p| !p.muted).count();
@@ -284,6 +300,36 @@ impl Session {
         deltas
     }
 
+    /// Diff `load` paths against current state.
+    ///
+    /// A path is compared by the text the performer wrote, not by a resolved
+    /// filename: resolution is the consumer's (§2.5), and it is the only side
+    /// that can tell two spellings of one file apart.
+    fn diff_loads(&self, new_loads: &[String]) -> Vec<Delta> {
+        let mut deltas = Vec::new();
+        for path in new_loads {
+            if !self.loads.contains(path) {
+                deltas.push(Delta::Load(path.clone()));
+            }
+        }
+        for path in self.loads.iter() {
+            if !new_loads.contains(path) {
+                deltas.push(Delta::Unload(path.clone()));
+            }
+        }
+        // A pure reorder changes which file wins a name, so the whole set has
+        // to be resolved again even though nothing was added or removed.
+        if deltas.is_empty() && self.loads != new_loads {
+            deltas.extend(new_loads.iter().cloned().map(Delta::Load));
+        }
+        deltas
+    }
+
+    /// `load` paths in the buffer, in the order they were written.
+    pub fn loads(&self) -> &[String] {
+        &self.loads
+    }
+
     /// Instruments defined in the buffer, by name.
     pub fn definitions(&self) -> &HashMap<String, InstrumentDef> {
         &self.definitions
@@ -358,6 +404,38 @@ mod tests {
         assert!(!session.evaluate(shadowing).errors.is_empty());
         // A failed evaluation must not poison the session.
         assert!(session.groups().is_empty());
+    }
+
+    #[test]
+    fn test_loads_are_tracked_and_diffed() {
+        let mut session = Session::new();
+        let result = session.evaluate("load \"pads.trbl\"\nkick kick \"x ~\"");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.deltas.contains(&Delta::Load("pads.trbl".into())));
+        assert_eq!(session.loads(), ["pads.trbl"]);
+
+        // Unchanged buffer, nothing to resolve again.
+        let result = session.evaluate("load \"pads.trbl\"\nkick kick \"x ~\"");
+        assert!(result.deltas.is_empty(), "{:?}", result.deltas);
+
+        // A second file is one new load, not a re-resolve of both.
+        let result = session.evaluate("load \"pads.trbl\"\nload \"keys.trbl\"\nkick kick \"x ~\"");
+        assert_eq!(result.deltas, vec![Delta::Load("keys.trbl".into())]);
+
+        // Swapping the order changes which file wins a name, so both reload.
+        let result = session.evaluate("load \"keys.trbl\"\nload \"pads.trbl\"\nkick kick \"x ~\"");
+        assert_eq!(
+            result.deltas,
+            vec![
+                Delta::Load("keys.trbl".into()),
+                Delta::Load("pads.trbl".into())
+            ]
+        );
+
+        let result = session.evaluate("kick kick \"x ~\"");
+        assert!(result.deltas.contains(&Delta::Unload("pads.trbl".into())));
+        assert!(result.deltas.contains(&Delta::Unload("keys.trbl".into())));
+        assert!(session.loads().is_empty());
     }
 
     #[test]
