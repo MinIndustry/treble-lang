@@ -599,15 +599,35 @@ fn parse_transform_ramp(
     })
 }
 
-/// `4`, `4..16` or `2>4>8>16`, from one whitespace-delimited argument.
+/// `4`, `4..16`, `2>4>8>16` or `r(...)`, from one whitespace-delimited
+/// argument.
 ///
-/// The two spellings mean different things, so mixing them in one argument is
-/// an error rather than a guess.
-fn ramp_from_text<T: Copy>(
+/// The two range spellings mean different things, so mixing them in one
+/// argument is an error rather than a guess.
+pub(crate) fn ramp_from_text<T: Copy>(
     text: &str,
     name: &str,
     parse: impl Fn(&str) -> Result<T, String>,
 ) -> Result<Ramp<T>, String> {
+    ramp_from_text_dyn(text, name, &parse)
+}
+
+/// The `dyn` layer: `r(...)` re-enters ramp parsing for its range argument,
+/// and a generic closure parameter would nest a new type each level.
+fn ramp_from_text_dyn<T: Copy>(
+    text: &str,
+    name: &str,
+    parse: &dyn Fn(&str) -> Result<T, String>,
+) -> Result<Ramp<T>, String> {
+    if let Some(inner) = text.strip_prefix("r(") {
+        let Some(inner) = inner.strip_suffix(')') else {
+            return Err(format!(
+                "{name}: '{text}' does not close its parenthesis — r(...) is written \
+                 without spaces, e.g. r(300,9000,4,exp)"
+            ));
+        };
+        return timed_ramp_from_args(inner, name, &parse);
+    }
     let sweeps = text.contains("..");
     let steps = text.contains('>');
     if sweeps && steps {
@@ -630,6 +650,72 @@ fn ramp_from_text<T: Copy>(
     let first = parse(stages.next().unwrap_or_default())?;
     let rest = stages.map(parse).collect::<Result<Vec<T>, String>>()?;
     Ok(Ramp::steps(first, rest))
+}
+
+/// The inside of `r(...)`: a range, then optionally a span in time divisions
+/// and a curve. `r(300,9000)` is plain `300..9000`; `r(300,9000,4)` carries
+/// its own four-beat window; `r(2>4>8,6,osc)` cycles its stages.
+fn timed_ramp_from_args<T: Copy>(
+    inner: &str,
+    name: &str,
+    parse: &dyn Fn(&str) -> Result<T, String>,
+) -> Result<Ramp<T>, String> {
+    let args: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if args.iter().any(|arg| arg.is_empty()) {
+        return Err(format!("{name}: r(...) has an empty argument"));
+    }
+
+    // The range: one leading argument spelt `a..b`/`a>b>c`, or two arguments
+    // read as `from,to`.
+    let (ramp, rest) = if args[0].contains("..") || args[0].contains('>') {
+        (ramp_from_text_dyn(args[0], name, parse)?, &args[1..])
+    } else if args.len() >= 2 {
+        let from = parse(args[0])?;
+        let to = parse(args[1])?;
+        (Ramp::Sweep { from, to }, &args[2..])
+    } else {
+        return Err(format!(
+            "{name}: r(...) needs a travel — r(from,to), r(a..b) or r(a>b>c)"
+        ));
+    };
+    if !ramp.travels() {
+        return Err(format!("{name}: r(...) needs a travel, not a single value"));
+    }
+
+    let mut rest = rest.iter();
+    let Some(span_text) = rest.next() else {
+        // No span of its own: plain sugar, the line's `| ramp` governs it.
+        return Ok(ramp);
+    };
+    let span_divisions: f64 = span_text.parse().map_err(|_| {
+        format!("{name}: r(...) span '{span_text}' is not a number of time divisions")
+    })?;
+    if !span_divisions.is_finite() || span_divisions <= 0.0 {
+        return Err(format!(
+            "{name}: r(...) span must be a positive number of time divisions"
+        ));
+    }
+    let curve = match rest.next().copied() {
+        None => RampCurve::Linear,
+        Some("lin") => RampCurve::Linear,
+        Some("exp") => RampCurve::Exponential,
+        Some("osc") => RampCurve::Oscillate,
+        Some(other) => {
+            return Err(format!(
+                "{name}: r(...) style '{other}' is not a curve; use 'lin' (the default), 'exp' or 'osc'"
+            ));
+        }
+    };
+    if let Some(extra) = rest.next() {
+        return Err(format!(
+            "{name}: r(...) has an unexpected argument '{extra}'"
+        ));
+    }
+    Ok(Ramp::Timed {
+        ramp: Box::new(ramp),
+        span_divisions,
+        curve,
+    })
 }
 
 /// Every value a ramp passes through has to be legal, not only the one it
@@ -1395,6 +1481,58 @@ mod tests {
             }]
         );
         assert_eq!(RampCurve::default(), RampCurve::Linear);
+    }
+
+    #[test]
+    fn test_r_form_without_a_span_is_plain_sugar() {
+        assert_eq!(
+            transforms("p pad \"0\" | vel r(0.4,1.0)"),
+            transforms("p pad \"0\" | vel 0.4..1.0")
+        );
+        assert_eq!(
+            transforms("p pad \"0\" | vel r(0.4>0.6>1.0)"),
+            transforms("p pad \"0\" | vel 0.4>0.6>1.0")
+        );
+    }
+
+    #[test]
+    fn test_r_form_with_a_span_carries_its_own_window() {
+        let parsed = transforms("p pad \"0\" | vel r(0.4,1.0,4,osc)");
+        assert_eq!(
+            parsed,
+            vec![Transform::Vel(Ramp::Timed {
+                ramp: Box::new(Ramp::Sweep { from: 0.4, to: 1.0 }),
+                span_divisions: 4.0,
+                curve: RampCurve::Oscillate,
+            })]
+        );
+        // The style defaults to lin, and fractions of a division are legal.
+        assert_eq!(
+            transforms("p pad \"0\" | vel r(0.4,1.0,0.5)"),
+            vec![Transform::Vel(Ramp::Timed {
+                ramp: Box::new(Ramp::Sweep { from: 0.4, to: 1.0 }),
+                span_divisions: 0.5,
+                curve: RampCurve::Linear,
+            })]
+        );
+    }
+
+    #[test]
+    fn test_r_form_still_range_checks_its_travel() {
+        let error = parse_line("p pad \"0\" | vel r(0.4,2.0,4)").unwrap_err();
+        assert!(error.contains("outside the supported range"), "{error}");
+    }
+
+    #[test]
+    fn test_r_form_errors_are_specific() {
+        let error = parse_line("p pad \"0\" | vel r(0.4, 1.0, 4)").unwrap_err();
+        assert!(error.contains("without spaces"), "{error}");
+        let error = parse_line("p pad \"0\" | vel r(0.5)").unwrap_err();
+        assert!(error.contains("needs a travel"), "{error}");
+        let error = parse_line("p pad \"0\" | vel r(0.4,1.0,4,sine)").unwrap_err();
+        assert!(error.contains("'sine' is not a curve"), "{error}");
+        let error = parse_line("p pad \"0\" | vel r(0.4,1.0,exp)").unwrap_err();
+        assert!(error.contains("time divisions"), "{error}");
     }
 
     #[test]
