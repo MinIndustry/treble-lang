@@ -1,0 +1,16 @@
+# Local development overrides — copy to `.cargo/config.toml` (git-ignored):
+#
+#     cp .cargo/config.toml.example .cargo/config.toml
+#
+# Nothing here is needed for a normal build: the `render` feature pins
+# treble-core by released tag and cargo resolves it from GitHub. Copy this file
+# when you are editing the engine next door and want the change picked up
+# without a tag round-trip.
+#
+# It must stay out of `Cargo.toml`. A committed `[patch]` names paths that exist
+# on one machine, so CI and every fresh clone fail on it.
+#
+# Paths are relative to the directory holding `.cargo/`, i.e. the repo root.
+
+[patch."https://github.com/MinIndustry/treble-core.git"]
+treble = { path = "../treble-core" }

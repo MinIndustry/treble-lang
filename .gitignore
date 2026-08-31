@@ -1,2 +1,6 @@
 target/
 .DS_Store
+
+# Local sibling-checkout redirection for treble-core, used by the `render`
+# feature. Load-bearing for local development, never committed.
+.cargo/config.toml
