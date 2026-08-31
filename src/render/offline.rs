@@ -165,6 +165,7 @@ fn render_inner(
                 at_frame,
                 cycle_frames,
                 &mut automations,
+                piece.seed,
             )?;
             if let Some(group) = &line.group {
                 bus_members
@@ -282,6 +283,7 @@ fn mount_line(
     start_frame: u64,
     cycle_frames: u64,
     automations: &mut Vec<AutomationSpec>,
+    seed: u64,
 ) -> Result<Placed, String> {
     let travel = LineTravel {
         line: Travel::START,
@@ -319,6 +321,7 @@ fn mount_line(
         },
         origin_cycle,
         section.sig.0,
+        seed,
     );
 
     // Sweeps are declared against this occurrence's own frame window, which is
@@ -527,6 +530,51 @@ mod tests {
         assert!(!out.samples.is_empty());
     }
 
+    /// `seed` (§8.8) reaches the generative constructs, and the same seed
+    /// reproduces.
+    ///
+    /// It did not: the walk was hashed on the step index alone, so the
+    /// directive documented as salting the generative constructs changed
+    /// nothing at all.
+    #[test]
+    fn the_seed_rerolls_a_generated_walk_and_repeats_exactly() {
+        let render_with = |seed: u64| {
+            let source = format!(
+                "seed {seed}\nbpm 120\ntail 0\nsection a 4 {{\n  walk pluck \"solo(0..7, 6)\"\n}}\n"
+            );
+            let (program, errors) = crate::parser::parse_program(&source);
+            assert!(errors.is_empty(), "{errors:?}");
+            let (piece, errors) = crate::piece::resolve(&program, (120, (4, 4), None));
+            assert!(errors.is_empty(), "{errors:?}");
+            let registry = InstrumentRegistry::built_in();
+            let notes = scheduled_notes(&piece, &registry, 44_100).expect("notes");
+            notes.into_iter().map(|note| note.midi).collect::<Vec<u8>>()
+        };
+
+        let zero = render_with(0);
+        let seven = render_with(7);
+        assert!(!zero.is_empty(), "the walk generated nothing");
+        assert_ne!(zero, seven, "the seed changed nothing");
+        assert_eq!(zero, render_with(0), "the same seed did not reproduce");
+        assert_eq!(seven, render_with(7), "the same seed did not reproduce");
+    }
+
+    /// Rendering twice gives the same samples, which is what makes a render
+    /// usable in a build.
+    #[test]
+    fn two_renders_of_one_piece_are_identical() {
+        let source = "bpm 120\ntail 0\nsection a 2 {\n  k kick \"x*4\"\n  h hihat \"x*8\"\n                        p pad \"[c3,e3,g3]\"\n}\n";
+        let (program, _) = crate::parser::parse_program(source);
+        let (piece, _) = crate::piece::resolve(&program, (120, (4, 4), None));
+        let registry = InstrumentRegistry::built_in();
+        let first = render(&piece, &registry, 44_100).expect("render");
+        let second = render(&piece, &registry, 44_100).expect("render");
+        assert_eq!(
+            first.samples, second.samples,
+            "two renders of one piece differed"
+        );
+    }
+
     #[test]
     fn an_empty_arrangement_is_refused_rather_than_rendered_silent() {
         let (program, _) = crate::parser::parse_program("bpm 120\n");
@@ -535,4 +583,95 @@ mod tests {
             render(&piece, &InstrumentRegistry::built_in(), 44_100).expect_err("nothing to render");
         assert!(error.contains("nothing to render"), "{error}");
     }
+}
+
+/// Every note the piece schedules, as `(absolute frame, midi)`.
+///
+/// The same walk [`render`] makes, stopping before any audio. Exposed because
+/// a piece's note content is worth checking on its own — a harmonic premise
+/// ("every note comes from one collection") is a property of the notes, not of
+/// the samples, and asserting it against the audio would be guesswork.
+pub fn scheduled_notes(
+    piece: &Piece,
+    registry: &InstrumentRegistry,
+    sample_rate: u32,
+) -> Result<Vec<ScheduledNote>, String> {
+    let mut notes = Vec::new();
+    let mut at_frame = 0u64;
+    for occurrence in &piece.timeline {
+        let section = &piece.sections[occurrence.section];
+        let cycle_frames = section_cycle_frames(section, sample_rate);
+        let origin_cycle = occurrence.start_cycle;
+        for line in section
+            .patterns
+            .iter()
+            .chain(&piece.throughout)
+            .filter(|line| !line.muted && !section.muted)
+        {
+            let travel = LineTravel {
+                line: Travel::START,
+                cycle: origin_cycle as f64,
+                origin: origin_cycle,
+                divisions: section.sig.0,
+            };
+            let (audio_fx, fx_ramps) =
+                pattern_fx(&line.transforms, section.cycle_seconds(), travel)
+                    .map_err(|error| format!("'{}': {error}", line.name))?;
+            let spec = registry
+                .get(&line.instrument)
+                .ok_or_else(|| format!("'{}': unknown instrument", line.name))?
+                .clone();
+            let instrument_fx = spec.fx.len();
+            let compiled = compile_pattern(
+                line,
+                section.scale,
+                audio_fx,
+                fx_ramps,
+                instrument_fx,
+                spec,
+                PatternGate::default(),
+                origin_cycle,
+                section.sig.0,
+                piece.seed,
+            );
+            let from = line.span.map_or(1, |s| s.start());
+            let to = line.span.map_or(section.cycles, |s| s.end(section.cycles));
+            for cycle in from..=to.min(section.cycles) {
+                let absolute = origin_cycle + u64::from(cycle - 1);
+                let cycle_start = at_frame + u64::from(cycle - 1) * cycle_frames;
+                for strike in cycle_strikes(&compiled, absolute) {
+                    let start = cycle_start + (strike.start * cycle_frames as f64).round() as u64;
+                    let end = start
+                        + ((strike.end - strike.start) * NOTE_GATE * cycle_frames as f64).round()
+                            as u64;
+                    for midi in strike.notes {
+                        notes.push(ScheduledNote {
+                            start,
+                            end: end.max(start + 1),
+                            midi,
+                            line: line.name.clone(),
+                            section: section.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        at_frame += cycle_frames * u64::from(section.cycles);
+    }
+    notes.sort_by_key(|note| (note.start, note.midi));
+    Ok(notes)
+}
+
+/// One scheduled note, with enough context to reason about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledNote {
+    /// Absolute frame the note starts on.
+    pub start: u64,
+    /// Absolute frame its gate closes.
+    pub end: u64,
+    pub midi: u8,
+    /// The pattern line that played it.
+    pub line: String,
+    /// The section it was played in.
+    pub section: String,
 }

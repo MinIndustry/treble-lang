@@ -1,6 +1,6 @@
 [package]
 name = "treble-lang"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
@@ -9,7 +9,7 @@ nom = "8.0"
 # The language proper knows nothing about the engine, so both of these are
 # optional: parsing a buffer must not drag in a DSP stack. `render` turns on the
 # lowering half and the headless renderer that sits on it.
-treble = { version = "0.4.0", git = "https://github.com/MinIndustry/treble-core.git", tag = "0.4.0", optional = true }
+treble = { version = "0.4.1", git = "https://github.com/MinIndustry/treble-core.git", tag = "0.4.1", optional = true }
 hound = { version = "3.5", optional = true }
 
 [dev-dependencies]
@@ -22,3 +22,14 @@ render = ["dep:treble", "dep:hound"]
 [[bin]]
 name = "treble-lang"
 path = "src/main.rs"
+
+# Compositional analysis tools. They read a piece's notes rather than its
+# audio, because a harmonic claim ("every note comes from one collection") is a
+# property of the notes and asserting it against samples would be guesswork.
+[[example]]
+name = "notes"
+required-features = ["render"]
+
+[[example]]
+name = "clashes"
+required-features = ["render"]
