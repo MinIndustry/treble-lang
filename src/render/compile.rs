@@ -141,6 +141,10 @@ pub struct CompiledPattern {
     /// The signature's numerator when this snapshot compiled — how `r(...)`
     /// spans in time divisions convert to cycles.
     pub divisions: u8,
+    /// The buffer's `seed` (§8.8), mixed into every generative choice this
+    /// line makes. Without it the walk was hashed on the step index alone and
+    /// the directive documented in §8.8 changed nothing.
+    pub seed: u64,
 }
 
 impl CompiledPattern {
@@ -349,7 +353,9 @@ pub fn cycle_strikes(pattern: &CompiledPattern, cycle: u64) -> Vec<Strike> {
         }
         let outer_start = segment.start * cycle_factor;
         let outer_duration = (segment.end - segment.start) * cycle_factor;
-        let seed = segment.source_step as u64;
+        // The step index keeps sibling steps independent; the buffer's seed is
+        // what makes the whole passage rerollable.
+        let seed = mix_seed(pattern.seed, segment.source_step);
         for resolved in resolve_events(&segment.event, cycle, &pattern.name, seed) {
             let start = outer_start + resolved.start * outer_duration;
             // `:v` and `X` are absolute: they replace the line's `| vel` for the
@@ -383,6 +389,7 @@ pub fn compile_pattern(
     gate: PatternGate,
     ramp_origin: u64,
     divisions: u8,
+    seed: u64,
 ) -> CompiledPattern {
     let window = ramp_window(pattern, ramp_origin);
     let mut slots = Vec::new();
@@ -429,6 +436,7 @@ pub fn compile_pattern(
         velocity_scale_ramp: None,
         ramp_origin,
         divisions,
+        seed,
     }
 }
 

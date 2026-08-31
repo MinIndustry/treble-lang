@@ -89,6 +89,8 @@ pub struct Session {
     /// How many cycles a phrase spans. Changes are quantised to it, so `1` is
     /// "apply at the next cycle" and `16` is "apply at the top of the phrase".
     pub phrase: u32,
+    /// `seed` (§8.8) — salts every generative construct in the buffer.
+    pub seed: u64,
     /// Default scale for degree patterns (`scale` directive).
     pub scale: Option<(PitchRoot, ScaleMode)>,
     /// Active patterns by name.
@@ -114,6 +116,7 @@ impl Session {
             bpm: 120,
             sig: (4, 4),
             phrase: 1,
+            seed: 0,
             scale: None,
             patterns: HashMap::new(),
             definitions: HashMap::new(),
@@ -167,6 +170,7 @@ impl Session {
         let mut new_bpm = self.bpm;
         let mut new_sig = self.sig;
         let mut new_phrase = self.phrase;
+        let mut new_seed = self.seed;
         let mut new_scale = self.scale;
         let mut new_patterns: HashMap<String, PatternDef> = HashMap::new();
         let mut new_definitions: HashMap<String, InstrumentDef> = HashMap::new();
@@ -185,7 +189,8 @@ impl Session {
                 SourceLine::Phrase(cycles) => new_phrase = *cycles,
                 SourceLine::Scale(root, mode) => new_scale = Some((*root, *mode)),
                 SourceLine::Load(path) => new_loads.push(path.clone()),
-                SourceLine::Seed(_) | SourceLine::Meta(_, _) => {}
+                SourceLine::Seed(value) => new_seed = *value,
+                SourceLine::Meta(_, _) => {}
                 directive @ (SourceLine::Arrange(_) | SourceLine::Tail(_)) if !is_piece => {
                     group_errors.push(group_error(
                         line_idx + 1,
@@ -281,6 +286,7 @@ impl Session {
         self.bpm = new_bpm;
         self.sig = new_sig;
         self.phrase = new_phrase;
+        self.seed = new_seed;
         self.scale = new_scale;
 
         // Update pattern state
