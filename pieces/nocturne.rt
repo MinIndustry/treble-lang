@@ -1,0 +1,491 @@
+-- =====================================================================
+--  Seven Rooms, One Key
+--
+--  ONE COLLECTION. G major, one sharp — G A B C D E F#. Not a single
+--  note outside it is sounded anywhere in the piece. What moves instead
+--  is the TONAL CENTRE, so each section is a different room in the same
+--  house and no simultaneity anywhere can be wrong:
+--
+--      C lydian    C D E F# G A B      bright, floating   (the #4 shimmer)
+--      A dorian    A B C D E F# G      neutral, in motion (natural 6)
+--      B phrygian  B C D E F# G A      the darkest usable (b2 over the drone)
+--      E aeolian   E F# G A B C D      plain minor        (the crisis)
+--      G major     G A B C D E F#      home, arrived last
+--
+--  Note that on one sharp the phrygian centre is B, not E: E is aeolian
+--  here, and writing `scale E phrygian` would smuggle an F natural into
+--  the piece and break the whole premise on its first bar. F# locrian is
+--  the one centre this collection cannot bear, and it is never used.
+--
+--  THE THEME ("the Ring") is written in scale degrees and never in note
+--  names, so one `scale` line re-colours every interval in it while its
+--  contour survives intact:
+--
+--      degrees   1  5  6 | 4  3  2  0
+--      rhythm    2  2  3 | 2  2  1  2      (fourteen eighths, 2+2+3)
+--
+--  Its signature is the rising fifth 1->5. That fifth is perfect in
+--  lydian, dorian, phrygian and ionian — and a TRITONE in aeolian,
+--  because degrees 1 and 5 of E on one sharp are F# and C, the only
+--  tritone the collection owns. The theme therefore breaks of its own
+--  accord at exactly one point in its own key, and `crux` is that point.
+--  Nothing is added to the note-set to do it.
+--
+--  ONE PULSE, MANY BARS. bpm 84 holds from the first bar to the coda, so
+--  the eighth note is 168/min in every room: 7/8, 4/4 and 5/8 are one
+--  heartbeat measured out in different lengths of bar. The theme in 4/4
+--  is a true augmentation — quarters where it had eighths — rather than
+--  merely a slower playing of it, and in 5/8 a true compression. Only
+--  `gate` modulates, to 56, where the new eighth is the old triplet.
+--
+--  THE SEVEN-CLOCK. `clock` plays (3,7) in every room. In 7/8 that is
+--  three strokes on the eighths, 3+2+2 — the theme's own 2+2+3 rotated.
+--  In 4/4 and 5/8 the same figure re-grids into septuplets and drifts
+--  against the barline. One shape, four metres, exactly like the theme.
+--
+--  THE GENERATED LINES. `wing` and `brand` are seeded walks (§3.19). The
+--  walk is hashed on the line's NAME, so the name is not a label here —
+--  it is part of the composition, chosen by auditioning candidates and
+--  keeping the two whose phrases had the best shape. Both are bounded to
+--  degrees that keep them inside the room they are playing in.
+-- =====================================================================
+
+meta title    "Seven Rooms, One Key"
+meta composer "Claude"
+meta comment  "One diatonic collection — G major, one sharp — with a moving tonal centre: C lydian, A dorian, B phrygian, E aeolian, home to G. The theme is written in scale degrees so every return re-colours it, and is heard in 7/8, 4/4 and 5/8 against a single constant eighth-note pulse."
+
+bpm 84
+sig 7/8
+scale C lydian
+seed 7
+tail 9.0
+
+-- ---------------------------------------------------------------------
+--  Instruments
+-- ---------------------------------------------------------------------
+
+-- Struck glass. A sine fundamental with two genuinely inharmonic bar
+-- partials — 2.76 and 5.40 are the free-free bar modes — each on its own
+-- shorter envelope, so the clang dies away before the pitch does. The
+-- theme's voice in the bright rooms.
+def glass {
+    voice     poly 10 replaceoldest
+    lifecycle oneshot
+    tone      sine gain 0.62 identity
+    tone sine ratio 2.76 {
+        env attack  linear 0 0.18 0.001
+        env decay   linear 0.18 0 0.85
+        env sustain constant 0
+        env release constant 0
+    }
+    tone sine ratio 5.4 {
+        env attack  linear 0 0.08 0.001
+        env decay   linear 0.08 0 0.40
+        env sustain constant 0
+        env release constant 0
+    }
+    tone      triangle gain 0.13 harmonic 2
+    mix       sum
+    env       adsr 0.002 1.9 0.0 0.65
+    lpf       5200
+    gain      0.72
+    velsens   0.85
+}
+
+-- The pad. Two triangles four cents apart plus a quiet second harmonic
+-- and a whisper of sub: almost no odd-harmonic bite, so it sits under
+-- everything without fighting the lead for the middle. The tremolo is
+-- one sweep per sixteen seconds — felt as breathing, not heard as an
+-- effect.
+def haze {
+    voice     poly 12 replaceoldest
+    lifecycle gated
+    tone      triangle gain 0.42 identity
+    tone      triangle gain 0.30 ratio 1.004
+    tone      sine gain 0.16 harmonic 2
+    tone      saw gain 0.07 ratio 0.4995
+    mix       sum
+    env       adsr 1.10 0.90 0.62 1.60
+    lpf       1500
+    trem      0.062hz 0.18
+    gain      0.55
+    velsens   0.60
+}
+
+-- A hollow reed: odd harmonics only, 1 3 5 7 in a falling series, which
+-- is the clarinet's spectrum and reads as woody and covered rather than
+-- bright. Carries the theme in the dark rooms and doubles it an octave
+-- below the glass in the bright ones.
+def hollow {
+    voice     poly 6 replaceoldest
+    lifecycle gated
+    tone      sine gain 0.55 identity
+    tone      sine gain 0.26 harmonic 3
+    tone      sine gain 0.11 harmonic 5
+    tone      sine gain 0.05 harmonic 7
+    tone      triangle gain 0.10 ratio 1.002
+    mix       sum
+    env       adsr 0.055 0.25 0.70 0.45
+    lpf       2600
+    gain      0.68
+    velsens   0.90
+}
+
+-- The drone. Monophonic on purpose: one pedal note at a time, replaced
+-- rather than layered, so the bottom of the piece can never turn to mud.
+-- Filtered at 420 Hz — it is a floor, not a voice.
+def moor {
+    voice     mono replace
+    lifecycle gated
+    tone      sine gain 0.80 identity
+    tone      sine gain 0.22 harmonic 2
+    tone      triangle gain 0.10 harmonic 3
+    mix       sum
+    env       adsr 0.35 0.60 0.78 1.40
+    lpf       420
+    gain      0.75
+    velsens   0.50
+}
+
+-- Plucked. The noise tone is the fingernail: eighteen milliseconds of
+-- it, gone before the string has properly spoken, which is what makes a
+-- pluck read as a pluck and not as a short organ note.
+def thread {
+    voice     poly 12 replaceoldest
+    lifecycle oneshot
+    tone      triangle gain 0.50 identity
+    tone      sawraw gain 0.15 identity
+    tone      sine gain 0.17 harmonic 4
+    tone noise {
+        env attack  linear 0 0.10 0.0005
+        env decay   linear 0.10 0 0.018
+        env sustain constant 0
+        env release constant 0
+    }
+    mix       sum
+    env       adsr 0.004 0.55 0.0 0.28
+    lpf       3400
+    gain      0.60
+    velsens   1.00
+}
+
+-- The seven-clock. Tubular-bell partials — 2.01, 3.02, 4.17, 5.43 —
+-- high-passed so only the shimmer survives and it never competes for
+-- the middle of the mix.
+def chime {
+    voice     poly 8 replaceoldest
+    lifecycle oneshot
+    tone      sine gain 0.34 identity
+    tone      sine gain 0.22 ratio 2.01
+    tone      sine gain 0.14 ratio 3.02
+    tone      sine gain 0.09 ratio 4.17
+    tone      sine gain 0.06 ratio 5.43
+    mix       sum
+    env       adsr 0.001 1.25 0.0 0.50
+    hpf       520
+    gain      0.40
+    velsens   1.00
+}
+
+-- Frame drum. Two fixed low sines plus a pink-noise slap, pitched in
+-- hertz rather than by note so it stays exactly where it is whichever
+-- room the piece has moved to.
+def skin {
+    voice     poly 4 replaceoldest
+    lifecycle oneshot
+    tone      sine freq 74 gain 0.85
+    tone      sine freq 111 gain 0.28
+    tone      triangle freq 168 gain 0.12
+    tone pinknoise {
+        env attack  linear 0 0.26 0.0008
+        env decay   linear 0.26 0 0.055
+        env sustain constant 0
+        env release constant 0
+    }
+    mix       sum
+    env       adsr 0.002 0.42 0.0 0.16
+    lpf       900
+    gain      0.70
+    velsens   1.00
+}
+
+-- Air. Not a note — a slow band of noise, used twice, to cover a seam.
+def dust {
+    voice     poly 2 replaceoldest
+    lifecycle gated
+    tone      pinknoise gain 0.70
+    tone      noise gain 0.16
+    mix       sum
+    env       adsr 1.40 1.00 0.50 2.20
+    hpf       300
+    lpf       1600
+    gain      0.45
+    velsens   0.80
+}
+
+-- ---------------------------------------------------------------------
+--  I. dawn — C lydian, 7/8, 35s.
+--     The theme stated bare over its own drone. One line enters every
+--     other pair of bars and nothing is varied yet; the pad is G-D-E
+--     over a C, which is a major ninth with the third on top and no F#
+--     in it at all — the shimmer is saved for the melody.
+-- ---------------------------------------------------------------------
+
+section dawn 14 {
+  bpm 84
+  sig 7/8
+  scale C lydian
+
+  pedal moor   "c2@6 ~@1"                                       | gain 0.90 | pan -0.12
+  air   haze   "[g3,d4,e4]@4 ~@3"                    @ 3..      | gain 0.60 | reverb 0.52 | pan 0.15
+  ring  glass  "[1@2 5@2 6@3 4@2 3@2 2@1 0@2]/2"     @ 5..      | oct 1 | vel 0.62 | reverb 0.42 | delay 0.714 0.26 0.20 | pan 0.20
+  clock chime  "<4 6 2 4>(3,7)"                      @ 7..      | oct 1 | vel 0.30 | reverb 0.60 | pan -0.45
+  harp  thread "~ 4 ~ 6 ~ 2 ~"                       @ 11..     | vel 0.40 | reverb 0.35 | pan 0.42
+}
+
+-- ---------------------------------------------------------------------
+--  II. drift — A dorian, 7/8, 40s.
+--     Same contour, new room: the leap 1->5 now lands on F#, which is
+--     dorian's characteristic sixth, and the fall 2->0 lands on A. The
+--     fourteen-eighth phrase is answered by its own strict melodic
+--     inversion — 5 1 0 2 3 4 6, every degree-step negated — in exactly
+--     the rhythm it had, so bars 3-4 are bars 1-2 turned upside down.
+--     The drone moves for the first time: A for four eighths, a breath,
+--     then E for two, which turns the pad from Am6/9 into Em7 under it.
+-- ---------------------------------------------------------------------
+
+section drift 16 {
+  bpm 84
+  sig 7/8
+  scale A dorian
+
+  pedal moor   "a1@4 ~@1 e2@2"                                  | gain 0.90 | pan -0.12
+  air   haze   "[a3,e4,f#4]@4 [g3,d4,e4]@3"                     | gain 0.58 | reverb 0.52 | pan 0.15
+  ring  glass  "[1@2 5@2 6@3 4@2 3@2 2@1 0@2 5@2 1@2 0@3 2@2 3@2 4@1 6@2]/4"  | vel 0.66 | reverb 0.42 | delay 0.714 0.26 0.20 | pan 0.22
+  under hollow "[4@6 2@4 1@4]/2"                     @ 5..      | oct -1 | vel 0.50 | lpf 1600 | reverb 0.30 | pan -0.30
+  clock chime  "<4 6 2 4>(3,7)"                                 | oct 1 | vel 0.30 | reverb 0.60 | pan -0.45
+  harp  thread "~ 4 ~ 6 ~ 2 ~"                       @ 3..      | vel 0.42 | reverb 0.35 | pan 0.42
+
+  group kit {
+    drum skin  "X ~ ~ x ~ x ~"                       @ 9..      | vel 0.50 | pan -0.05
+    tick rim   "~ ~ x ~ ~ ~ x"                       @ 11..     | vel 0.32 | pan 0.50
+  } | lpf 7000 | gain 0.88
+}
+
+-- ---------------------------------------------------------------------
+--  III. shade — B phrygian, 4/4, 34s.
+--     The metre changes and the pulse does not, so the theme is heard in
+--     exact augmentation: quarters where it had eighths, sixteen beats
+--     where it had fourteen, the apex given the two extra. The reed
+--     takes it. The pad is kept strictly below the melody — Bm7, then
+--     Am7 over the B drone, both voiced without the phrygian second, so
+--     that C arrives only in the tune, where it belongs. `glow` tolls a
+--     single high B once every four bars.
+-- ---------------------------------------------------------------------
+
+section shade 12 {
+  bpm 84
+  sig 4/4
+  scale B phrygian
+
+  pedal moor   "b1@3 ~@1"                                       | gain 0.92 | pan -0.10
+  air   haze   "[b3,f#4,a4]@2 [a3,e4,g4]@2"                     | gain 0.60 | reverb 0.58 | pan 0.12
+  ring  hollow "[1@2 5@2 6@4 4@2 3@2 2@2 0@2]/4"                | vel 0.62 | lpf 1400..3000 | ramp 12 exp | reverb 0.35 | pan -0.18
+  glow  glass  "0/4"                                 @ 5..      | oct 1 | vel 0.30 | reverb 0.62 | pan 0.35
+  clock chime  "<0 4 2 5>(3,7)"                                 | vel 0.24 | reverb 0.62 | pan -0.45
+  drum  skin   "X ~ ~ ~"                             @ 3..      | vel 0.44 | pan 0.00
+  wash  dust   "x/2"                                 @ 9..      | vel 0.30 | gain 0.45 | reverb 0.55
+}
+
+-- ---------------------------------------------------------------------
+--  IV. crux — E aeolian, 4/4, 23s.
+--     The one room the theme cannot stand up in. Degrees 1 and 5 of E on
+--     one sharp are F# and C, so the rising fifth that has opened every
+--     statement so far collapses into a tritone. Only the head survives,
+--     struck four times over an E drone while the filter opens on it;
+--     the glass answers a bar behind with the same two notes an octave
+--     up, and the delay makes a third of them. Em9 to Cadd9 beneath.
+-- ---------------------------------------------------------------------
+
+section crux 8 {
+  bpm 84
+  sig 4/4
+  scale E aeolian
+
+  pedal moor   "e1@3 ~@1"                                       | gain 0.95 | pan -0.10
+  air   haze   "[e3,b3,d4]@2 [c4,g4,d5]@2"                      | gain 0.62 | reverb 0.50 | pan 0.12
+  ring  hollow "[1@2 5@2 6@4]/2"                                | vel 0.72 | lpf 900..3400 | ramp 8 exp | reverb 0.28 | pan -0.20
+  echo  glass  "[~@4 1@2 5@2]/2"                     @ 3..      | oct 1 | vel 0.40 | reverb 0.50 | delay 0.714 0.30 0.25 | pan 0.35
+  low   thread "0 ~ 2 ~"                             @ 5..      | oct -1 | vel 0.45 | lpf 1200 | reverb 0.25 | pan -0.42
+
+  group kit {
+    drum skin  "X ~ x ~"                                        | vel 0.55..0.85 | ramp 8 | pan 0.00
+    hats hihat "x*4 x*8"                             @ 5..      | vel 0.28 | pan 0.45
+  } | lpf 7000 | gain 0.88
+}
+
+-- ---------------------------------------------------------------------
+--  V. press — A dorian, 5/8, 29s. Played twice: here, and again as a
+--     ritornello the moment the solo ends.
+--     The bar is cut from seven eighths to five with the pulse left
+--     alone, so the theme is compressed rather than hurried: fourteen
+--     eighths become ten and the 2+2+3 opening is squeezed to 1+2+2.
+--     The same notes, with no room left in them.
+-- ---------------------------------------------------------------------
+
+section press 16 {
+  bpm 84
+  sig 5/8
+  scale A dorian
+
+  pedal moor   "a1@3 e2@2"                                      | gain 0.90 | pan -0.10
+  pulse thread "0 4 6 4 3"                                      | oct -1 | vel 0.45 | lpf 1800..4200 | ramp 8 exp | reverb 0.20 | pan -0.35
+  air   haze   "[a3,e4,g4]@3 [b3,f#4,d5]@2"                     | gain 0.50 | reverb 0.42 | pan 0.20
+  ring  hollow "[1@1 5@2 6@2 4@1 3@1 2@1 0@2]/2"     @ 5..      | vel 0.70 | lpf 2400 | reverb 0.25 | pan 0.15
+  clock chime  "<4 6 2 4>(3,7)"                      @ 3..      | oct 1 | vel 0.28 | reverb 0.55 | pan -0.45
+
+  group kit {
+    drum skin  "X ~ x ~ x"                                      | vel 0.62 | pan 0.00
+    hats hihat "x:0.45 x:0.22 x:0.38 x:0.22 x:0.30"             | pan 0.40
+    tick rim   "~ ~ x ~ ~"                           @ 7..      | vel 0.35 | pan -0.50
+  } | lpf 7000 | gain 0.88
+}
+
+-- ---------------------------------------------------------------------
+--  VI. solo — A dorian, 5/8, 29s. Written question, generated answer.
+--     The reed asks with the theme's HEAD (1 5 6) for four bars and with
+--     its TAIL (4 3 2 0) for four more; between them the glass answers
+--     with a seeded walk of four notes to the bar, which against a bar
+--     of five eighths never lines up with the ostinato twice running.
+--     The walk is bounded to degrees -3..10 — E4 to D6 — so it cannot
+--     leave the room, and its cadence rule pulls each bar's last note
+--     toward the centre of that span, which here is E: the fifth of A
+--     dorian, so the answers keep settling onto a reciting tone.
+-- ---------------------------------------------------------------------
+
+section solo 16 {
+  bpm 84
+  sig 5/8
+  scale A dorian
+
+  pedal moor   "a1@3 e2@2"                                      | gain 0.88 | pan -0.10
+  pulse thread "0 4 6 4 3"                                      | oct -1 | vel 0.42 | lpf 2600 | reverb 0.20 | pan -0.35
+  air   haze   "[a3,e4,g4]@3 [b3,f#4,d5]@2"                     | gain 0.46 | reverb 0.45 | pan 0.20
+
+  callA hollow "[1@2 5@2 6@1 ~@5]/2"                 @ 1..4     | vel 0.68 | reverb 0.30 | pan 0.10
+  wing  glass  "solo(-3..10, 4)"                     @ 5..12    | vel 0.55 | reverb 0.40 | delay 0.357 0.24 0.20 | pan 0.30
+  callB hollow "[4@2 3@2 2@1 0@5]/2"                 @ 13..16   | vel 0.68 | reverb 0.30 | pan 0.10
+
+  group kit {
+    drum skin  "X ~ x ~ x"                                      | vel 0.55 | pan 0.00
+    hats hihat "x:0.40 x:0.20 x:0.34 x:0.20 x:0.28"             | pan 0.40
+  } | lpf 7000 | gain 0.88
+}
+
+-- ---------------------------------------------------------------------
+--  VII. flight — A dorian, 5/8, 21s. The walk alone, densifying.
+--     One `ramp 12` governs the whole section, so the walk thickens from
+--     four notes a bar to eleven while its velocity rises with it, the
+--     pluck opens from 1.6 kHz to 5 kHz and the drum grows underneath —
+--     a single twelve-bar gesture with nothing else in it. The tune is
+--     absent for the first time in the piece; only its room remains.
+-- ---------------------------------------------------------------------
+
+section flight 12 {
+  bpm 84
+  sig 5/8
+  scale A dorian
+
+  pedal moor   "a1@3 e2@2"                                      | gain 0.90 | pan -0.10
+  pulse thread "0 4 6 4 3"                                      | oct -1 | vel 0.42..0.60 | lpf 1600..5000 | ramp 12 exp | reverb 0.20 | pan -0.35
+  air   haze   "[a3,e4,g4]@3 [b3,f#4,d5]@2"                     | gain 0.48 | reverb 0.45 | pan 0.20
+  brand glass  "solo(-3..10, 4..12)"                            | ramp 12 | vel 0.45..0.75 | reverb 0.38 | delay 0.357 0.26 0.22 | pan 0.30
+  lift  chime  "<4 6 2 4>(3,7)"                      @ 5..      | oct 1 | vel 0.30 | reverb 0.60 | pan -0.45
+
+  group kit {
+    drum skin  "X ~ x ~ x"                                      | vel 0.50..0.80 | ramp 12 | pan 0.00
+    hats hihat "x:0.28 x:0.16 x:0.24 x:0.16 x:0.22"             | pan 0.40
+    tick rim   "~ ~ x ~ ~"                           @ 5..      | vel 0.35 | pan -0.50
+  } | lpf 7000 | gain 0.88
+}
+
+-- ---------------------------------------------------------------------
+--  VIII. crest — C lydian, 4/4, 46s. The home colour, augmented, in
+--     three real parts: the glass has the theme, the reed doubles it an
+--     octave below, and the plucked line runs the inversion underneath
+--     it. The two outer lines cross at F# — the lydian fourth, the sharp
+--     the whole piece is named for — and land a major seventh apart over
+--     the C drone. The pad finally admits the F# itself, alternating
+--     G-D-E with G-D-F# every two beats.
+-- ---------------------------------------------------------------------
+
+section crest 16 {
+  bpm 84
+  sig 4/4
+  scale C lydian
+
+  pedal moor    "c2@3 g2@1"                                     | gain 0.95 | pan -0.10
+  air   haze    "[g3,d4,e4]@2 [g3,d4,f#4]@2"                    | gain 0.62 | reverb 0.50 | pan 0.15
+  ring  glass   "[1@2 5@2 6@4 4@2 3@2 2@2 0@2]/4"               | oct 1 | vel 0.75 | reverb 0.40 | delay 0.714 0.24 0.18 | pan 0.20
+  twin  hollow  "[1@2 5@2 6@4 4@2 3@2 2@2 0@2]/4"               | vel 0.60 | lpf 2800 | reverb 0.28 | pan -0.22
+  mirror thread "[5@2 1@2 0@4 2@2 3@2 4@2 6@2]/4"    @ 5..      | vel 0.45 | lpf 3200 | reverb 0.30 | pan 0.45
+  pulse thread  "0 4 6 4"                            @ 9..      | oct -1 | vel 0.38 | lpf 3000 | reverb 0.20 | pan -0.40
+  clock chime   "<4 6 2 4>(3,7)"                                | oct 1 | vel 0.32 | reverb 0.60 | pan -0.45
+
+  group kit {
+    drum skin  "X ~ x ~"                                        | vel 0.60 | pan 0.00
+    hats hihat "x*8"                                 @ 5..      | vel 0.26 | pan 0.40
+    tick rim   "~ ~ ~ x"                             @ 7..      | vel 0.38 | pan 0.50
+  } | lpf 7000 | gain 0.88
+}
+
+-- ---------------------------------------------------------------------
+--  IX. veil — C lydian, 4/4, 23s.
+--     The theme loses its second half: head, then two bars of nothing.
+--     The pad closes from 2.4 kHz to 700 Hz across the section and the
+--     air comes back over the seam.
+-- ---------------------------------------------------------------------
+
+section veil 8 {
+  bpm 84
+  sig 4/4
+  scale C lydian
+
+  pedal moor   "c2@3 ~@1"                                       | gain 0.85 | pan -0.10
+  air   haze   "[g3,d4,e4]@2 [g3,d4,f#4]@2"                     | gain 0.55 | reverb 0.62 | lpf 2400..700 | ramp 8 exp | pan 0.15
+  ring  glass  "[1@2 5@2 6@4 ~@8]/4"                            | oct 1 | vel 0.50 | reverb 0.55 | delay 0.714 0.30 0.28 | pan 0.20
+  clock chime  "<4 6 2 4>(3,7)"                      @ ..6      | oct 1 | vel 0.24 | reverb 0.65 | pan -0.45
+  drum  skin   "X ~ ~ ~"                             @ ..4      | vel 0.38 | pan 0.00
+  wash  dust   "x/2"                                 @ 5..      | vel 0.26 | gain 0.40 | reverb 0.60 | lpf 2600..500 | ramp 8 exp
+}
+
+-- ---------------------------------------------------------------------
+--  X. gate — G major, 4/4 at 56, 34s. The only tempo change in the
+--     piece, and it is a modulation rather than a slowing: the new
+--     eighth is the old triplet eighth.
+--
+--     The pad plays the same three notes it has played since bar 3 —
+--     G, D, E and G, D, F# — but the drone under it is now G, so the
+--     chord that was Cmaj9 and then a lydian #11 is heard as G6 and
+--     Gmaj7. Nothing about the harmony has changed except what it is
+--     standing on. That is the whole argument of the piece in one bar.
+--
+--     The theme keeps only its rise, 1 5 6, and is allowed for the first
+--     and only time to finish: F# to G, the sharp resolving as a leading
+--     tone, which is precisely what C lydian never let it do.
+-- ---------------------------------------------------------------------
+
+section gate 8 {
+  bpm 56
+  sig 4/4
+  scale G major
+
+  pedal moor   "g1@3 ~@1"                                       | gain 0.95 | pan -0.10
+  air   haze   "[[g3,d4,e4]@4 [g3,d4,f#4]@4 [g3,d4,e4]@4 [g3,d4,b4]@4]/4"  | gain 0.62 | reverb 0.60 | pan 0.15
+  ring  glass  "[1@4 5@4 6@6 7@2]/4"                            | vel 0.60 | reverb 0.50 | delay 1.071 0.28 0.24 | pan 0.20
+  twin  hollow "[1@4 5@4 6@6 7@2]/4"                 @ 5..      | oct -1 | vel 0.45 | lpf 2000 | reverb 0.30 | pan -0.20
+  clock chime  "<4 6 2 4>(3,7)"                      @ ..4      | vel 0.26 | reverb 0.65 | pan -0.45
+  low   thread "0 ~ ~ ~"                             @ 3..      | oct -1 | vel 0.35 | lpf 1600 | reverb 0.40 | pan -0.40
+}
+
+arrange dawn drift shade crux press solo flight press crest veil gate

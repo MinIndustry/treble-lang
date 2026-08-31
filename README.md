@@ -71,3 +71,25 @@ meta comment  "One collection, three centres."
 
 The key set is open. Well-known keys map to their standard tags; anything else
 is filed alongside the comment rather than dropped.
+
+## An example piece
+
+`pieces/nocturne.rt` is a complete five-and-a-half-minute piece — ten sections,
+seven instruments defined in the buffer, a theme in three metres, and a
+question-and-answer solo. It is the toolchain's end-to-end case:
+
+```
+treble check  pieces/nocturne.rt
+treble info   pieces/nocturne.rt
+treble render pieces/nocturne.rt
+```
+
+Renders are reproducible, so the WAV is not kept in the repository — the source
+beside it is the artefact.
+
+The analysis examples read its notes rather than its audio:
+
+```
+cargo run --features render --example notes   -- pieces/nocturne.rt
+cargo run --features render --example clashes -- pieces/nocturne.rt
+```

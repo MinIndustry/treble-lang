@@ -1,0 +1,2 @@
+# Renders are reproducible from the source beside them, so they are not kept.
+*.wav
