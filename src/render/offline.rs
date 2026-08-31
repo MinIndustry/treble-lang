@@ -438,7 +438,10 @@ mod tests {
         assert!((piece.seconds - 4.0).abs() < 1e-6, "{}", piece.seconds);
         assert_eq!(piece.samples.len(), 5 * 44_100 * 2);
         assert_eq!(piece.notes, 4);
-        assert!(peak(&piece, 0, 44_100) > 0.001, "the first second is silent");
+        assert!(
+            peak(&piece, 0, 44_100) > 0.001,
+            "the first second is silent"
+        );
     }
 
     #[test]
@@ -450,8 +453,14 @@ mod tests {
              arrange b a\n",
         );
         let cycle = 2 * 44_100;
-        assert!(peak(&piece, 0, cycle) < 1e-6, "the silent section must be silent");
-        assert!(peak(&piece, cycle, 2 * cycle) > 0.001, "the sounding one must follow");
+        assert!(
+            peak(&piece, 0, cycle) < 1e-6,
+            "the silent section must be silent"
+        );
+        assert!(
+            peak(&piece, cycle, 2 * cycle) > 0.001,
+            "the sounding one must follow"
+        );
     }
 
     #[test]
@@ -522,8 +531,8 @@ mod tests {
     fn an_empty_arrangement_is_refused_rather_than_rendered_silent() {
         let (program, _) = crate::parser::parse_program("bpm 120\n");
         let (piece, _) = crate::piece::resolve(&program, (120, (4, 4), None));
-        let error = render(&piece, &InstrumentRegistry::built_in(), 44_100)
-            .expect_err("nothing to render");
+        let error =
+            render(&piece, &InstrumentRegistry::built_in(), 44_100).expect_err("nothing to render");
         assert!(error.contains("nothing to render"), "{error}");
     }
 }
