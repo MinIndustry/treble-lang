@@ -313,9 +313,10 @@ fn parse_transform_keyword(
                 None => RampCurve::Linear,
                 Some("lin") => RampCurve::Linear,
                 Some("exp") => RampCurve::Exponential,
+                Some("osc") => RampCurve::Oscillate,
                 Some(other) => {
                     return Err(format!(
-                        "ramp: '{other}' is not a curve; use 'lin' (the default) or 'exp'"
+                        "ramp: '{other}' is not a curve; use 'lin' (the default), 'exp' or 'osc'"
                     ));
                 }
             };
@@ -1397,10 +1398,24 @@ mod tests {
     }
 
     #[test]
+    fn test_osc_ramp_curve_parses() {
+        assert_eq!(
+            transforms("p pad \"0\" | ramp 8 osc"),
+            vec![Transform::RampSpan {
+                cycles: 8,
+                curve: RampCurve::Oscillate
+            }]
+        );
+    }
+
+    #[test]
     fn test_ramp_curve_errors_are_specific() {
         let error = parse_line("p pad \"0\" | ramp 8 sine").unwrap_err();
         assert!(error.contains("'sine' is not a curve"), "{error}");
-        assert!(error.contains("lin") && error.contains("exp"), "{error}");
+        assert!(
+            error.contains("lin") && error.contains("exp") && error.contains("osc"),
+            "{error}"
+        );
         // The arity is still fixed: one curve, not two.
         assert!(
             parse_line("p pad \"0\" | ramp 8 exp lin")

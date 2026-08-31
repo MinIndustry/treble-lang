@@ -177,6 +177,9 @@ pub enum RampCurve {
     Linear,
     /// `exp` — equal ratio steps.
     Exponential,
+    /// `osc` — oscillate between the ends instead of arriving: a triangle
+    /// with the span as its period, `from → to → from`, wrapping forever.
+    Oscillate,
 }
 
 /// Arpeggiator mode.
