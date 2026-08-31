@@ -4,6 +4,8 @@
 //! into a WAV. Rendering is behind the `render` feature, because the language
 //! itself has no engine dependency and a checker should not need one.
 
+// Only the renderer deals in paths; `check` and `info` take them as strings.
+#[cfg(feature = "render")]
 use std::path::{Path, PathBuf};
 
 const USAGE: &str = "\
