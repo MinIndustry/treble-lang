@@ -283,6 +283,18 @@ pub enum Ramp<T> {
     ///
     /// Split into head and tail so the sequence can never be empty.
     Steps { first: T, rest: Vec<T> },
+    /// `r(...)` — a travel that carries its own window instead of inheriting
+    /// the line's `| ramp`: a span in **time divisions** (the signature's
+    /// beats) and its own curve. In 4/4, `r(300,9000,4)` spans one cycle; in
+    /// 2/4 the same span is two. Written without internal spaces.
+    Timed {
+        /// The travel itself — always `Sweep` or `Steps`.
+        ramp: Box<Ramp<T>>,
+        /// Window length in time divisions. Fractions are legal: `0.5` is
+        /// half a beat, which with `osc` is a wobble.
+        span_divisions: f64,
+        curve: RampCurve,
+    },
 }
 
 impl<T: Copy> Ramp<T> {
@@ -305,6 +317,7 @@ impl<T: Copy> Ramp<T> {
             Self::Fixed(value) => *value,
             Self::Sweep { from, .. } => *from,
             Self::Steps { first, .. } => *first,
+            Self::Timed { ramp, .. } => ramp.start(),
         }
     }
 
@@ -323,6 +336,19 @@ impl<T: Copy> Ramp<T> {
                 all.extend(rest.iter().copied());
                 all
             }
+            Self::Timed { ramp, .. } => ramp.values(),
+        }
+    }
+
+    /// The window a `r(...)` value carries, if it has one of its own.
+    pub fn own_window(&self) -> Option<(f64, RampCurve)> {
+        match self {
+            Self::Timed {
+                span_divisions,
+                curve,
+                ..
+            } => Some((*span_divisions, *curve)),
+            _ => None,
         }
     }
 }
