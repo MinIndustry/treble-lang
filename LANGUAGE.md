@@ -158,12 +158,13 @@ against.
 
 Three more directives belong to pieces and are specified with them in §8:
 `arrange` (§8.4) orders the sections, `tail` (§8.7) sets how long a render
-rings out past the last cycle, and `seed` (§8.8) salts the generative
-constructs so a passage can be rerolled.
+rings out past the last cycle, `seed` (§8.8) salts the generative constructs so
+a passage can be rerolled, and `meta` (§8.9) carries the piece's own title and
+credits.
 
 `arrange` and `tail` are errors in a live buffer, and `phrase` (§2.3) is an
 error in a piece — a piece is not being edited while it plays, so it has no
-boundary to land a change on. `seed` is accepted in both.
+boundary to land a change on. `seed` and `meta` are accepted in both.
 
 ---
 
@@ -1268,7 +1269,39 @@ it had.
 A live buffer accepts `seed` too — the reroll is just as useful mid-session —
 but the value takes effect at the next boundary like any other directive.
 
-### 8.9 Playback and Rendering
+### 8.9 `meta <key> "<value>"`
+
+```
+meta title    "Nocturne for a Slow Machine"
+meta composer "F. Grimau"
+meta comment  "One collection, three centres."
+meta tuning   "twelve-tone equal"
+```
+
+    meta_line = "meta" identifier string_literal ;
+
+A free-form tag that travels with the piece. The key set is deliberately open:
+a piece knows things about itself that a music language has no business
+enumerating, and a renderer can pass whatever it finds straight through to the
+file it writes.
+
+Keys are lower-cased, so `Title` and `title` are one tag. Writing a key twice
+replaces it rather than accumulating, so editing a title does not leave the
+previous one behind in the output.
+
+Nothing in the language reads these — they change no sound and produce no
+delta. A consumer decides what to do with them; the reference renderer writes
+the well-known ones (`title`, `composer`, `artist`, `album`, `genre`, `year`,
+`comment`, `copyright`) into the WAV's `INFO` chunk and files the rest
+alongside the comment, since dropping what the author wrote would be worse than
+filing it loosely.
+
+`meta` is accepted in a live buffer too. It is inert there, but a performance
+that gets captured to disk carries its own name that way.
+
+---
+
+### 8.10 Playback and Rendering
 
 A piece has a definite length: the sum of its arranged sections' cycles, plus
 `tail`. That is what makes it renderable — a consumer can compile the whole
@@ -1364,7 +1397,7 @@ blank         = { whitespace } ;
 comment       = "--" { any_char } ;
 
 directive     = bpm_dir | sig_dir | phrase_dir | scale_dir | load_dir
-              | include_dir | arrange_dir | tail_dir | seed_dir ;
+              | include_dir | arrange_dir | tail_dir | seed_dir | meta_dir ;
 bpm_dir       = "bpm" integer ;
 sig_dir       = "sig" integer "/" integer ;
 phrase_dir    = "phrase" integer ;          (* live only *)
@@ -1375,6 +1408,7 @@ arrange_dir   = "arrange" arrange_item { arrange_item } ;   (* piece only, §8.4
 arrange_item  = name [ "*" integer ] ;
 tail_dir      = "tail" number ;             (* piece only, §8.7 *)
 seed_dir      = "seed" integer ;            (* §8.8 *)
+meta_dir      = "meta" name string_literal ;  (* §8.9 *)
 
 pattern_line  = name instrument string_literal [ span ] { "|" transform } ;
 muted_line    = ";" name instrument string_literal [ span ] { "|" transform } ;

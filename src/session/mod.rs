@@ -185,7 +185,7 @@ impl Session {
                 SourceLine::Phrase(cycles) => new_phrase = *cycles,
                 SourceLine::Scale(root, mode) => new_scale = Some((*root, *mode)),
                 SourceLine::Load(path) => new_loads.push(path.clone()),
-                SourceLine::Seed(_) => {}
+                SourceLine::Seed(_) | SourceLine::Meta(_, _) => {}
                 directive @ (SourceLine::Arrange(_) | SourceLine::Tail(_)) if !is_piece => {
                     group_errors.push(group_error(
                         line_idx + 1,
