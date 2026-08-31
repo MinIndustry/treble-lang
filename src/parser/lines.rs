@@ -38,6 +38,15 @@ pub fn parse_line(line: &str) -> Result<SourceLine, String> {
     if let Some(rest) = strip_keyword(trimmed, "include") {
         return parse_include(rest);
     }
+    if let Some(rest) = strip_keyword(trimmed, "arrange") {
+        return parse_arrange(rest);
+    }
+    if let Some(rest) = strip_keyword(trimmed, "tail") {
+        return parse_tail(rest);
+    }
+    if let Some(rest) = strip_keyword(trimmed, "seed") {
+        return parse_seed(rest);
+    }
     // Early builds used `use`; keep it as a parse-compatible alias while all
     // diagnostics and documentation point to the clearer `include` spelling.
     if let Some(rest) = strip_keyword(trimmed, "use") {
@@ -48,6 +57,13 @@ pub fn parse_line(line: &str) -> Result<SourceLine, String> {
     if trimmed == "group" || strip_keyword(trimmed, "group").is_some() {
         return parse_group_header(trimmed, false);
     }
+    // Section markers (§8.2). `section` is reserved the same way.
+    if trimmed == "section" || strip_keyword(trimmed, "section").is_some() {
+        return parse_section_header(trimmed, false);
+    }
+    // A bare `}` closes whichever block is open; only a group's may carry a
+    // pipeline, so the line parser reads the general form and
+    // [`parse_program`](super::parse_program) decides which block it ends.
     if let Some(rest) = trimmed.strip_prefix('}') {
         return parse_group_footer(rest);
     }
@@ -57,6 +73,9 @@ pub fn parse_line(line: &str) -> Result<SourceLine, String> {
         let rest = rest.trim_start();
         if rest == "group" || strip_keyword(rest, "group").is_some() {
             return parse_group_header(rest, true);
+        }
+        if rest == "section" || strip_keyword(rest, "section").is_some() {
+            return parse_section_header(rest, true);
         }
         return parse_pattern_line(rest, true);
     }
@@ -79,6 +98,41 @@ fn parse_group_header(line: &str, muted: bool) -> Result<SourceLine, String> {
     Ok(SourceLine::GroupStart {
         muted,
         name: name.to_string(),
+    })
+}
+
+/// `[;] section <name> <cycles> {` — the length is stated, not inferred (§8.2).
+fn parse_section_header(line: &str, muted: bool) -> Result<SourceLine, String> {
+    let rest = strip_keyword(line, "section")
+        .ok_or_else(|| "section: expected 'section <name> <cycles> {'".to_string())?;
+    let Some(body) = rest.strip_suffix('{') else {
+        return Err("section: the header must end with '{'".to_string());
+    };
+    let mut parts = body.split_whitespace();
+    let name = parts
+        .next()
+        .ok_or_else(|| "section: expected a name before the length".to_string())?;
+    validate_identifier(name).map_err(|error| format!("section: {error}"))?;
+    let Some(cycles) = parts.next() else {
+        return Err(format!(
+            "section: '{name}' needs a length in cycles — 'section {name} 16 {{'"
+        ));
+    };
+    let cycles: u32 = cycles
+        .parse()
+        .map_err(|_| format!("section: expected a length in cycles, got '{cycles}'"))?;
+    if cycles == 0 {
+        return Err("section: a section lasts at least one cycle".to_string());
+    }
+    if let Some(extra) = parts.next() {
+        return Err(format!(
+            "section: unexpected '{extra}' after the length (filters go on the member lines)"
+        ));
+    }
+    Ok(SourceLine::SectionStart {
+        muted,
+        name: name.to_string(),
+        cycles,
     })
 }
 
@@ -108,6 +162,57 @@ fn strip_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
 }
 
 // --- Directive parsers ---
+
+/// `arrange <name> [<name>*N …]` — the order the sections play in (§8.4).
+fn parse_arrange(input: &str) -> Result<SourceLine, String> {
+    let mut items = Vec::new();
+    for token in input.split_whitespace() {
+        let (name, repeat) = match token.split_once('*') {
+            Some((name, count)) => {
+                let repeat: u32 = count.parse().map_err(|_| {
+                    format!("arrange: expected a repeat count after '*', got '{count}'")
+                })?;
+                if repeat == 0 {
+                    return Err(format!(
+                        "arrange: '{name}*0' plays nothing — drop it from the line instead"
+                    ));
+                }
+                (name, repeat)
+            }
+            None => (token, 1),
+        };
+        validate_identifier(name).map_err(|error| format!("arrange: {error}"))?;
+        items.push(ArrangeItem {
+            section: name.to_string(),
+            repeat,
+        });
+    }
+    if items.is_empty() {
+        return Err("arrange: expected at least one section name".to_string());
+    }
+    Ok(SourceLine::Arrange(items))
+}
+
+/// `tail <seconds>` — how long a render rings out past the last cycle (§8.7).
+fn parse_tail(input: &str) -> Result<SourceLine, String> {
+    let raw = input.trim();
+    let seconds: f64 = raw
+        .parse()
+        .map_err(|_| format!("tail: expected a number of seconds, got '{raw}'"))?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(format!("tail: expected zero or more seconds, got '{raw}'"));
+    }
+    Ok(SourceLine::Tail(seconds))
+}
+
+/// `seed <integer>` — salts the generative constructs (§8.8).
+fn parse_seed(input: &str) -> Result<SourceLine, String> {
+    let raw = input.trim();
+    let seed: u64 = raw
+        .parse()
+        .map_err(|_| format!("seed: expected a non-negative integer, got '{raw}'"))?;
+    Ok(SourceLine::Seed(seed))
+}
 
 /// `phrase <cycles>` — the unit changes are quantised to.
 ///
@@ -223,18 +328,75 @@ fn parse_pattern_line(input: &str, muted: bool) -> Result<SourceLine, String> {
     let inner = &notation_str[1..notation_str.len() - 1];
     let notation = parse_mini(inner)?;
 
-    // Parse transforms: everything after the closing quote, split by `|`
+    // Everything after the closing quote: an optional `@ span`, then the `|`
+    // pipeline. The span's position is fixed rather than free (§8.3) — it says
+    // when the line exists, not what happens to it, so it stays adjacent to the
+    // notation and leaves the pipeline contiguous.
     let remainder: String = tokens.collect::<Vec<&str>>().join(" ");
-    let transforms = parse_transforms(remainder.trim())?;
+    let (span, rest) = split_span(remainder.trim())?;
+    let transforms = parse_transforms(rest.trim())?;
 
     Ok(SourceLine::Pattern(PatternDef {
         group: None,
+        section: None,
+        span,
         muted,
         name: name.to_string(),
         instrument: instrument.to_string(),
         notation,
         transforms,
     }))
+}
+
+/// Split a leading `@ <span>` off the tail of a pattern line, returning it and
+/// whatever pipeline follows.
+fn split_span(input: &str) -> Result<(Option<Span>, &str), String> {
+    let Some(rest) = input.strip_prefix('@') else {
+        return Ok((None, input));
+    };
+    let rest = rest.trim_start();
+    // The span runs to the first `|`, or to the end of the line.
+    let (body, tail) = match rest.find('|') {
+        Some(index) => rest.split_at(index),
+        None => (rest, ""),
+    };
+    Ok((Some(parse_span(body.trim())?), tail))
+}
+
+/// `3..8`, `5..`, `..4`, `8` — 1-based, both ends inclusive, either omittable.
+fn parse_span(body: &str) -> Result<Span, String> {
+    if body.is_empty() {
+        return Err("span: expected a cycle after '@' — '@ 8' or '@ 3..8'".to_string());
+    }
+    let cycle = |raw: &str| -> Result<u32, String> {
+        raw.parse::<u32>()
+            .map_err(|_| format!("span: expected a cycle number, got '{raw}'"))
+    };
+    let Some((from, to)) = body.split_once("..") else {
+        // A bare `@ n` is the single cycle n.
+        return Ok(Span::at(cycle(body)?));
+    };
+    let (from, to) = (from.trim(), to.trim());
+    if to.contains("..") {
+        return Err(format!("span: '{body}' has more than two ends"));
+    }
+    if from.is_empty() && to.is_empty() {
+        return Err(
+            "span: '@ ..' names no cycles — drop it to sound for the whole section".to_string(),
+        );
+    }
+    Ok(Span {
+        from: if from.is_empty() {
+            None
+        } else {
+            Some(cycle(from)?)
+        },
+        to: if to.is_empty() {
+            None
+        } else {
+            Some(cycle(to)?)
+        },
+    })
 }
 
 fn validate_identifier(s: &str) -> Result<(), String> {

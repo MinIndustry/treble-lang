@@ -1,11 +1,19 @@
-# Treble Live — Language Specification v0.1
+# Treble — Language Specification v0.2
 
 ## Overview
 
-Treble Live is a live-coding music DSL designed for real-time composition in a
-terminal environment. It prioritises brevity and immediacy: every line either
-configures the session or defines a looping pattern. Changes take effect at the
-next loop boundary (quantised to the time signature).
+Treble is a music DSL with two modes in one language.
+
+**Live**: every line either configures the session or defines a pattern that
+loops forever, and a change takes effect at the next loop boundary (quantised
+to the time signature). It prioritises brevity and immediacy — the whole point
+is that a line can be retyped while it sounds.
+
+**Piece** (§8): the same lines, gathered into named `section` blocks of a
+stated length and put in an order by `arrange`. A piece therefore has an end,
+which makes it renderable to a file rather than only performable. A live buffer
+is the degenerate case — a piece with no structure — and there is one parser,
+one mini-notation and one set of transforms behind both.
 
 The language draws inspiration from TidalCycles' mini-notation while remaining
 self-contained (no host language required).
@@ -14,19 +22,23 @@ self-contained (no host language required).
 
 ## 1. Source Structure
 
-A Treble Live source file (`.rt`) is a sequence of **lines**. Each line is one
-of:
+A Treble source file (`.rt`) is a sequence of **lines**. Each line is one of:
 
 | Line kind        | Syntax                                    |
 |------------------|-------------------------------------------|
 | Comment          | `-- <text>`                               |
 | Directive        | `<keyword> <value>`                       |
-| Pattern          | `<name> <instrument> "<mini-notation>" [| <transform> ...]` |
+| Pattern          | `<name> <instrument> "<mini-notation>" [@ <span>] [| <transform> ...]` |
 | Muted pattern    | `; <name> <instrument> "<mini-notation>"` |
+| Block header     | `def <name> {` · `[;] group <name> {` · `[;] section <name> <cycles> {` |
+| Block footer     | `}` , optionally `} | <transform> ...` on a group |
 | Blank line       | *(ignored)*                               |
 
-Lines are separated by newlines. There is no block structure, no braces, and no
-indentation significance.
+Lines are separated by newlines. Indentation is never significant: the three
+block forms are delimited by braces on their own header and footer lines, and
+their members stay ordinary lines so that line-based editing — muting a line,
+nudging it, reporting an error against it — keeps working inside a block. A
+`group` nests one level inside a `section`; nothing else nests.
 
 ### 1.1 Comments
 
@@ -135,12 +147,23 @@ cost of having to list the files a performance needs in the performance itself
 — which is also what makes the dependency list visible.
 
 **A missing or invalid file is an evaluation error**, reported per-line like any
-other, and the previous state keeps sounding (§8.3). A `load` never silences a
+other, and the previous state keeps sounding (§9.3). A `load` never silences a
 performance.
 
 Resolving the path is the consumer's job — this crate does no I/O and records
 the path exactly as written. The rules above are the contract it resolves
 against.
+
+### 2.6 Piece Directives
+
+Three more directives belong to pieces and are specified with them in §8:
+`arrange` (§8.4) orders the sections, `tail` (§8.7) sets how long a render
+rings out past the last cycle, and `seed` (§8.8) salts the generative
+constructs so a passage can be rerolled.
+
+`arrange` and `tail` are errors in a live buffer, and `phrase` (§2.3) is an
+error in a piece — a piece is not being edited while it plays, so it has no
+boundary to land a change on. `seed` is accepted in both.
 
 ---
 
@@ -504,8 +527,12 @@ freely with sequencing, choices, rests, and the usual modifiers (`?`, `@N`).
 A pattern line defines a named, looping musical phrase. Syntax:
 
 ```
-<name> <instrument> "<mini-notation>" [| <transform> ...]
+<name> <instrument> "<mini-notation>" [@ <span>] [| <transform> ...]
 ```
+
+The optional `@ <span>` narrows the line to part of the section it sits in and
+is only legal there (§8.3). Everything else on the line means the same in a
+live buffer and in a piece.
 
 ### 4.1 Pattern Name
 
@@ -1020,9 +1047,250 @@ like their pattern counterparts.
 
 ---
 
-## 8. Evaluation Semantics
+## 8. Pieces
 
-### 8.1 Quantised Application
+Everything up to here loops forever. A **piece** is the same language with a
+structure: named sections of a stated length, an order to play them in, and
+therefore an end. A piece is written, rendered and played back rather than
+performed, and it is the same file format, the same parser and the same
+mini-notation — a live buffer is simply a piece with no structure.
+
+```
+-- nocturne.rt
+bpm 96
+sig 4/4
+scale C minor
+seed 7
+tail 3.0
+
+section intro 8 {
+  pad  pad   "[c3,eb3,g3] ~ ~ ~"
+  bell piano "0 ~ ~ 4"           @ 5..
+}
+
+section verse 16 {
+  kick kick  "x ~ x ~"
+  bass saw   "c2 _ eb2 _ g1 _ f2 _" | lpf 400..4000 | ramp 16 exp
+  fill snare "x*16"               @ 16
+}
+
+section chorus 16 {
+  bpm 104
+  kick kick  "x*4"
+  lead saw   "0 3 5 7"            | vel 0.9
+  bass saw   "c2*2 eb2*2"
+}
+
+arrange intro verse chorus verse*2 chorus intro
+```
+
+### 8.1 Piece Mode
+
+A buffer is in **piece mode** if it contains at least one `section` block.
+Nothing else switches the mode on, and a buffer with no `section` behaves
+exactly as it did before pieces existed.
+
+The distinction matters because the two modes answer a different question. A
+live buffer asks *what is sounding now*; a piece asks *what sounds at cycle
+N of the whole*. Piece-only constructs (`section`, `arrange`, `tail`, `@`) are
+an error in a live buffer, and the live-only `phrase` is an error in a piece —
+a piece has no "next boundary to land the drop on", because nothing is being
+edited while it plays.
+
+### 8.2 `section <name> <cycles> { … }`
+
+```
+section verse 16 {
+  kick kick "x ~ x ~"
+}
+```
+
+The header is `section <name> <cycles> {` with nothing after the brace, and the
+closing `}` takes nothing after it. `<cycles>` is a positive integer: how many
+cycles the section lasts, which is stated rather than inferred because the
+length is the one thing about a section that cannot be read off its members —
+a one-cycle pattern repeated for sixteen cycles and the same pattern played
+once look identical inside the braces.
+
+A section may contain:
+
+- **pattern lines**, which loop for the section's length unless narrowed by a
+  span (§8.3);
+- **`group` blocks** (§7), which nest one level inside a section;
+- the directives **`bpm`**, **`sig`** and **`scale`**, scoped to the section
+  (§8.5).
+
+A section may not contain `def`, `load`, `include`, `phrase`, `arrange`,
+`tail`, `seed`, or another `section`. Sections do not nest. `section` is a
+reserved word, so no pattern may be named it, and a section name must not
+collide with a pattern or group name.
+
+`;` before `section` mutes every member at once, exactly as it does on a group.
+**The section's time still passes** — a muted section is a rest of its own
+length in the arrangement, not a removal from it, so muting a chorus to hear
+the transition around it does not shorten the piece.
+
+### 8.3 Spans: `@ <cycles>`
+
+A member line may narrow itself to part of its section. The span sits
+immediately after the mini-notation, before any `|`:
+
+```
+section verse 16 {
+  kick kick   "x ~ x ~"                    -- all 16 cycles
+  fill snare  "x*16"           @ 16        -- the last cycle only
+  bass saw    "c2 _ eb2 _"     @ 3..16     -- from cycle 3 to the end
+  pad  pad    "[c3,eb3,g3]"    @ 9..       -- the same, written open
+  hat  hihat  "x*8"            @ ..8       -- the first half
+}
+```
+
+    span = "@" ( integer | [ integer ] ".." [ integer ] ) ;
+
+Cycles are **1-based and inclusive at both ends** — `@ 3..16` sounds on cycles
+3 and 16 and every cycle between them. Both readings follow the rest of the
+language: `a..b` is an inclusive interval wherever it appears (§4.6), and a
+musician counting bars starts at one.
+
+Either end may be omitted. `@ 5..` runs from cycle 5 to the end of the section,
+`@ ..4` from the start through cycle 4, and a bare `@ n` is the single cycle
+`n`. A span whose start is after its end, or whose end is past the section's
+length, is an error: a line that can never sound is a mistake rather than a
+silence, and saying so at parse time is cheaper than hunting for it in a render.
+
+The position is fixed rather than free within the pipeline. A span is not a
+transform — it says *when the line exists*, not what happens to it — and
+keeping it adjacent to the notation leaves the `|` chain contiguous and
+scannable at a glance.
+
+A span is only meaningful inside a section. A **top-level pattern line in a
+piece** sounds for the whole arrangement, which is how a drone or a click track
+is written; a span on such a line is an error, because its cycle numbers would
+have to be piece-absolute and mean something different from every other span in
+the file.
+
+### 8.4 `arrange <name> [ <name> … ]`
+
+```
+arrange intro verse chorus verse*2 chorus intro
+```
+
+    arrange_dir  = "arrange" arrange_item { arrange_item } ;
+    arrange_item = name [ "*" integer ] ;
+
+The arrangement names sections in playing order. `name*N` plays a section N
+times in a row, reusing `*N` from the mini-notation, where it also means
+"repeat this".
+
+A section may appear any number of times or not at all — an unused section is
+a sketch, not an error, though a consumer is expected to say which sections it
+never played. A name that is not a section, an `arrange` with no items, and a
+second `arrange` line are all errors.
+
+**`arrange` is optional.** With no `arrange` line, the arrangement is the
+sections in source order, once each — which is what a file being written from
+the top down already means, and it lets a piece grow one section at a time
+before its structure is decided.
+
+### 8.5 Directives Inside a Section
+
+`bpm`, `sig` and `scale` inside a section are **scoped to that section**: they
+take effect at its first cycle and the previous value resumes when it ends.
+
+```
+bpm 96
+
+section verse 16 { … }            -- 96
+section chorus 16 { bpm 104 … }   -- 104
+section outro 8 { … }             -- 96 again
+```
+
+This is the one place a piece deliberately departs from how a score is usually
+notated, where a tempo marking persists until the next one. The reason is
+reuse: a section is *named* so it can be played from more than one place in the
+arrangement, and a directive that leaked forward would make the same name sound
+different depending on what preceded it. `arrange intro verse chorus` and
+`arrange chorus verse intro` would then play different `verse`s, and the
+arrangement line — the one line that is supposed to show the shape of the piece
+— would stop being readable on its own.
+
+A tempo that should hold across several sections is therefore written in each
+of them. That is more typing and it is honest: each section states the tempo it
+plays at, and reading any one of them tells you how it sounds.
+
+A `sig` change alters the length of a cycle and so the length of the section in
+real time, but not in cycles: `section bridge 8` is eight cycles of whatever
+`sig` is in force inside it.
+
+### 8.6 Time Inside a Section
+
+`ramp` (§4.6) and `every` (§4.3) count from the **start of the line's span in
+the current occurrence of the section**, not from the start of the piece.
+
+A section is self-contained for the same reason its directives are: `arrange
+verse*4` plays four identical verses, and a filter opening over the verse opens
+once per verse. The consequence is that a build cannot straddle the seam
+between two sections — a sweep that should run across the whole piece is
+written as one long section rather than as a repeat. That is the trade for
+being able to read a section on its own, and it is the more common case: most
+builds are a section-length gesture.
+
+### 8.7 `tail <seconds>`
+
+```
+tail 3.0
+```
+
+How long to keep rendering after the last cycle of the arrangement, so note
+releases, delay repeats and reverb tails ring out instead of being cut at the
+final barline. Defaults to `2.0`. A piece whose last chord is a long pad wants
+more; a piece that ends on a closed hi-hat wants none, and `tail 0` is legal.
+
+This is the length of the *rendered* tail, not a musical instruction — it adds
+no cycles to the arrangement and nothing new is triggered during it.
+
+### 8.8 `seed <integer>`
+
+```
+seed 7
+```
+
+The generative constructs — random choice (§3.12), random drop (§3.15),
+`solo` (§3.19) and a `rand` pan sweep (§4.4) — are resolved by hashing, not
+from a running RNG, so the same source already renders identically every time.
+`seed` salts that hash. It exists so a composer can **reroll** a generative
+passage without rewriting it: change the seed, get a different solo, keep the
+piece byte-identical to itself thereafter.
+
+Defaults to `0`, so every piece written before seeds existed keeps the phrase
+it had.
+
+A live buffer accepts `seed` too — the reroll is just as useful mid-session —
+but the value takes effect at the next boundary like any other directive.
+
+### 8.9 Playback and Rendering
+
+A piece has a definite length: the sum of its arranged sections' cycles, plus
+`tail`. That is what makes it renderable — a consumer can compile the whole
+timeline up front, schedule every event at an absolute frame, and write the
+result to a file, rather than staying one boundary ahead of a performer.
+
+Diffing and quantised application (§9) do not apply while a piece plays. A
+piece is re-evaluated from the top: an edit produces a new timeline and the
+consumer decides where to resume from, which is a transport question rather
+than a language one.
+
+This crate resolves the arrangement into a flat timeline — a list of section
+occurrences with their absolute starting cycle, the state in force in each,
+and the lines audible in each — and does nothing else with it. Turning that
+into audio, and choosing what to do with an edit mid-playback, is the
+consumer's half exactly as it is for the live language.
+
+---
+
+## 9. Evaluation Semantics
+
+### 9.1 Quantised Application
 
 When the user saves (`:w` or `Ctrl+S`), the source is parsed and diffed
 against the current live state. Changes are **queued** and applied at the next
@@ -1041,7 +1309,7 @@ against the current live state. Changes are **queued** and applied at the next
 | New or changed `load`        | Definitions swap at next loop boundary |
 | Removed `load`               | Its definitions leave at next loop boundary |
 
-### 8.2 Diffing Rules
+### 9.2 Diffing Rules
 
 The session tracks patterns by **name**. After parsing:
 
@@ -1057,7 +1325,7 @@ unloads its definitions. Only the consumer can see a file change, since this
 crate does no I/O — the session raises the load when the buffer's set of paths
 changes and the consumer raises it again when it notices the file itself move.
 
-### 8.3 Error Handling
+### 9.3 Error Handling
 
 Parsing is **line-independent**: an error on one line does not prevent other
 lines from being parsed and evaluated. The session keeps the last-good version
@@ -1071,7 +1339,7 @@ Errors are reported per-line in the eval output panel:
 [#0003] [ OK] 4/6 patterns updated successfully.
 ```
 
-### 8.4 State Model
+### 9.4 State Model
 
 The session maintains:
 
@@ -1087,7 +1355,7 @@ The session maintains:
 
 ---
 
-## 9. Grammar (Formal)
+## 10. Grammar (Formal)
 
 ```ebnf
 program       = { line } ;
@@ -1095,18 +1363,33 @@ line          = comment | directive | pattern_line | muted_line | blank ;
 blank         = { whitespace } ;
 comment       = "--" { any_char } ;
 
-directive     = bpm_dir | sig_dir | scale_dir | load_dir ;
+directive     = bpm_dir | sig_dir | phrase_dir | scale_dir | load_dir
+              | include_dir | arrange_dir | tail_dir | seed_dir ;
 bpm_dir       = "bpm" integer ;
 sig_dir       = "sig" integer "/" integer ;
+phrase_dir    = "phrase" integer ;          (* live only *)
 scale_dir     = "scale" pitch_root scale_mode ;
 load_dir      = "load" string_literal ;
+include_dir   = ( "include" | "use" ) name ;
+arrange_dir   = "arrange" arrange_item { arrange_item } ;   (* piece only, §8.4 *)
+arrange_item  = name [ "*" integer ] ;
+tail_dir      = "tail" number ;             (* piece only, §8.7 *)
+seed_dir      = "seed" integer ;            (* §8.8 *)
 
-pattern_line  = name instrument string_literal { "|" transform } ;
-muted_line    = ";" name instrument string_literal { "|" transform } ;
+pattern_line  = name instrument string_literal [ span ] { "|" transform } ;
+muted_line    = ";" name instrument string_literal [ span ] { "|" transform } ;
+
+(* Where the line sounds inside its section — 1-based, both ends inclusive,
+   either end omittable. Section members only (§8.3). *)
+span          = "@" ( integer | [ integer ] ".." [ integer ] ) ;
 
 group_header  = [ ";" ] "group" name "{" ;
 group_footer  = "}" { "|" transform } ;
 (* member pattern lines sit between header and footer, one per line *)
+
+section_header = [ ";" ] "section" name integer "{" ;   (* §8.2 *)
+section_footer = "}" ;                                  (* takes no pipeline *)
+(* members are pattern lines, group blocks, and bpm/sig/scale directives *)
 
 name          = identifier ;
 instrument    = identifier ;
@@ -1200,7 +1483,7 @@ string_literal = '"' { mini_char } '"' ;
 
 ---
 
-## 10. Example Session
+## 11. Example Session
 
 ```
 -- Minimal techno loop
@@ -1225,11 +1508,45 @@ This defines:
 - A piano lead playing a Cm7 arpeggio over 2 cycles
 - A muted pad pattern (ready to unmute by removing `;`)
 
+### 11.1 The Same Material as a Piece
+
+```
+-- Same techno, given a structure and an end
+bpm 128
+sig 4/4
+tail 2.5
+
+section intro 8 {
+  kick  kick   "x ~ x ~"
+  hats  hihat  "x*8"        @ 5..
+}
+
+section main 16 {
+  kick  kick   "x ~ x ~"
+  snare snare  "~ X ~ x"
+  hats  hihat  "x*8 x:0.4*8"
+  bass  saw    "c2 _ eb2 _ g1 _ f2 _" | pan -0.3 | lpf 300..9000 | ramp 16 exp
+  fill  snare  "x*16"       @ 16
+}
+
+section break 8 {
+  bpm 128
+  pad   pad    "[c3,eb3,g3] ~ [f3,ab3,c4] ~"
+  hats  hihat  "x*8"        @ 7..
+}
+
+arrange intro main break main*2 intro
+```
+
+Sixty-four cycles at 128 BPM plus a 2.5-second tail, playing the same lines the
+live buffer above does. `main` appears three times and sounds the same each
+time — its `lpf` build restarts with it (§8.6) — and the `fill` lands only on
+the last cycle of each `main`.
+
 ---
 
-## 11. Future Extensions (Not in v0.1)
+## 12. Future Extensions
 
-- `def` blocks for custom instrument synthesis (§6)
 - `fn` blocks for reusable pattern fragments
 - Per-pattern `bpm` / `sig` overrides (polymetric)
 - MIDI input/output
@@ -1244,3 +1561,8 @@ This defines:
 - LFO sweeps on parameters other than `pan` (`lpf`, `gain`, …), which need one
   modulated filter per parameter in the engine
 - Phase offset on a sweep, so two lines can be counter-panned against each other
+- Piece-absolute spans on a top-level line (§8.3), once there is a spelling
+  that cannot be confused with a section-relative one
+- A build that straddles a section seam (§8.6) — needs a way to name an origin
+  outside the current section without giving up a section's self-containment
+- Nested sections, so a piece can have movements as well as sections

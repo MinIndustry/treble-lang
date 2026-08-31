@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use crate::ast::{GroupDef, InstrumentDef, PatternDef, PitchRoot, Program, ScaleMode, SourceLine};
 use crate::error::CompileError;
 use crate::parser::parse_program;
+use crate::piece::{self, Piece};
 
 /// A change that will be applied at the next loop boundary.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,7 +41,7 @@ pub enum Delta {
     /// order of the `load` lines changed and with it which file wins a name.
     ///
     /// This crate does no I/O, so it cannot see a loaded file change on disk; a
-    /// consumer watching the file raises this same delta for that case (§8.2).
+    /// consumer watching the file raises this same delta for that case (§9.2).
     Load(String),
     /// A `load` line left the buffer, so its definitions go with it.
     Unload(String),
@@ -56,6 +57,13 @@ pub struct EvalResult {
     /// Summary counts.
     pub patterns_active: usize,
     pub patterns_muted: usize,
+    /// The resolved timeline when the buffer is a piece (§8), `None` when it
+    /// is a live buffer.
+    ///
+    /// A piece is not diffed: it is re-resolved from the top, so `deltas` is
+    /// empty for everything but the instrument definitions and `load` paths a
+    /// consumer still has to act on.
+    pub piece: Option<Piece>,
 }
 
 fn group_error(line: usize, message: String) -> CompileError {
@@ -96,6 +104,8 @@ pub struct Session {
     pending: Vec<Delta>,
     /// Last successfully parsed program (for diffing).
     last_program: Option<Program>,
+    /// The resolved piece, when the buffer has sections (§8).
+    piece: Option<Piece>,
 }
 
 impl Session {
@@ -111,7 +121,24 @@ impl Session {
             loads: Vec::new(),
             pending: Vec::new(),
             last_program: None,
+            piece: None,
         }
+    }
+
+    /// The resolved piece, when the buffer has sections (§8).
+    ///
+    /// This is the authoritative structure in piece mode: [`Session::patterns`]
+    /// still holds the union of every section's lines, but only so a consumer
+    /// can see which instruments the buffer needs — which line sounds when is
+    /// the piece's business, since the same name legitimately appears in every
+    /// section.
+    pub fn piece(&self) -> Option<&Piece> {
+        self.piece.as_ref()
+    }
+
+    /// Whether the buffer is a piece rather than a live session (§8.1).
+    pub fn is_piece(&self) -> bool {
+        self.piece.is_some()
     }
 
     /// Evaluate a source string, parse it, diff against previous state,
@@ -127,8 +154,14 @@ impl Session {
                 deltas: Vec::new(),
                 patterns_active: self.patterns.values().filter(|p| !p.muted).count(),
                 patterns_muted: self.patterns.values().filter(|p| p.muted).count(),
+                piece: self.piece.clone(),
             };
         }
+
+        // A buffer with sections is a piece (§8.1). The two modes share every
+        // line kind but differ in what a line means, so the mode is settled
+        // once here and the rest of the walk consults it.
+        let is_piece = piece::is_piece(&program);
 
         // Extract state from the new program
         let mut new_bpm = self.bpm;
@@ -152,6 +185,20 @@ impl Session {
                 SourceLine::Phrase(cycles) => new_phrase = *cycles,
                 SourceLine::Scale(root, mode) => new_scale = Some((*root, *mode)),
                 SourceLine::Load(path) => new_loads.push(path.clone()),
+                SourceLine::Seed(_) => {}
+                directive @ (SourceLine::Arrange(_) | SourceLine::Tail(_)) if !is_piece => {
+                    group_errors.push(group_error(
+                        line_idx + 1,
+                        format!(
+                            "{}: a live buffer has no sections to arrange or tail — add a \
+                             'section' block to make this a piece (§8.1)",
+                            match directive {
+                                SourceLine::Arrange(_) => "arrange",
+                                _ => "tail",
+                            }
+                        ),
+                    ));
+                }
                 SourceLine::Pattern(def) => {
                     new_patterns.insert(def.name.clone(), def.clone());
                 }
@@ -159,7 +206,10 @@ impl Session {
                     new_definitions.insert(definition.name.clone(), (**definition).clone());
                 }
                 SourceLine::GroupStart { muted, name } => {
-                    if new_groups.contains_key(name) {
+                    // In a piece the same bus is declared in every section that
+                    // feeds it, which is not a redeclaration; that the chains
+                    // agree is checked when the piece is resolved (§8.2).
+                    if !is_piece && new_groups.contains_key(name) {
                         group_errors.push(group_error(
                             line_idx + 1,
                             format!("group '{name}' is declared twice"),
@@ -182,8 +232,10 @@ impl Session {
                 _ => {}
             }
         }
-        // A group and a pattern sharing a name would collide in the mixer.
-        for name in new_groups.keys() {
+        // A group and a pattern sharing a name would collide in the mixer. In a
+        // piece the namespaces are per-section, so the piece resolver checks it
+        // there rather than against the flattened union here.
+        for name in new_groups.keys().filter(|_| !is_piece) {
             if new_patterns.contains_key(name) {
                 group_errors.push(group_error(
                     1,
@@ -197,6 +249,7 @@ impl Session {
                 deltas: Vec::new(),
                 patterns_active: self.patterns.values().filter(|p| !p.muted).count(),
                 patterns_muted: self.patterns.values().filter(|p| p.muted).count(),
+                piece: self.piece.clone(),
             };
         }
 
@@ -205,6 +258,24 @@ impl Session {
         deltas.extend(self.diff_definitions(&new_definitions));
         deltas.extend(self.diff_groups(&new_groups));
         deltas.extend(self.diff_loads(&new_loads));
+
+        // Resolve the arrangement into a timeline. A piece is not diffed — it
+        // is re-resolved from the top (§8.9) — so this replaces the pattern
+        // deltas rather than adding to them.
+        let mut piece = None;
+        if is_piece {
+            let (resolved, piece_errors) = piece::resolve(&program, (new_bpm, new_sig, new_scale));
+            if !piece_errors.is_empty() {
+                return EvalResult {
+                    errors: piece_errors,
+                    deltas: Vec::new(),
+                    patterns_active: self.patterns.values().filter(|p| !p.muted).count(),
+                    patterns_muted: self.patterns.values().filter(|p| p.muted).count(),
+                    piece: self.piece.clone(),
+                };
+            }
+            piece = Some(resolved);
+        }
 
         // Apply immediate directives
         self.bpm = new_bpm;
@@ -219,6 +290,7 @@ impl Session {
         self.groups = new_groups;
         self.loads = new_loads;
         self.last_program = Some(program);
+        self.piece = piece.clone();
 
         let patterns_active = self.patterns.values().filter(|p| !p.muted).count();
         let patterns_muted = self.patterns.values().filter(|p| p.muted).count();
@@ -228,6 +300,7 @@ impl Session {
             deltas,
             patterns_active,
             patterns_muted,
+            piece,
         }
     }
 
