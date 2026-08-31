@@ -78,6 +78,22 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
             if result.errors.len() == 1 { "" } else { "s" }
         ));
     }
+    // A `def` that parses can still be rejected when it is lowered onto the
+    // engine — "a tone takes either a `gain` level or its own envelope, not
+    // both" is a parse-clean, render-fatal mistake. Checking it here is the
+    // difference between finding it now and finding it at render time.
+    let lowering = check_definitions(&session);
+    for problem in &lowering {
+        eprintln!("{path}: {problem}");
+    }
+    if !lowering.is_empty() {
+        return Err(format!(
+            "{} instrument definition{} would not build",
+            lowering.len(),
+            if lowering.len() == 1 { "" } else { "s" }
+        ));
+    }
+
     match session.piece() {
         Some(piece) => println!(
             "{path}: piece — {} sections, {} occurrences, {} cycles, {}",
@@ -160,6 +176,35 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
         println!("\n  never played: {}", piece.unused.join(", "));
     }
     Ok(())
+}
+
+/// Problems a `def` block would hit when lowered onto the engine.
+///
+/// Only possible with the renderer available; without it the checker says what
+/// it can and stays quiet about the rest rather than pretending to have looked.
+#[cfg(feature = "render")]
+fn check_definitions(session: &treble_lang::Session) -> Vec<String> {
+    let cycle = session
+        .piece()
+        .and_then(|piece| piece.sections.first().map(|s| s.cycle_seconds()))
+        .unwrap_or(2.0);
+    let mut problems: Vec<String> = session
+        .definitions()
+        .values()
+        .filter_map(|definition| {
+            treble_lang::render::compile::lower_instrument_def(definition, cycle)
+                .err()
+                .map(|error| format!("def {}: {error}", definition.name))
+        })
+        .collect();
+    // Definitions live in a map, so sort for a stable report.
+    problems.sort();
+    problems
+}
+
+#[cfg(not(feature = "render"))]
+fn check_definitions(_session: &treble_lang::Session) -> Vec<String> {
+    Vec::new()
 }
 
 fn clock(seconds: f64) -> String {
