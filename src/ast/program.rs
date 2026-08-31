@@ -27,6 +27,8 @@ pub enum SourceLine {
     Tail(f64),
     /// `seed <integer>` — salts the generative constructs (§8.8).
     Seed(u64),
+    /// `meta <key> "<value>"` — a free-form tag travelling with the piece (§8.10).
+    Meta(String, String),
     /// `include <instrument>` — explicitly make a registry instrument available.
     Include(String),
     /// A `def <name> { … }` instrument definition (§6).

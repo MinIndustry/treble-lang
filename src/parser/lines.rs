@@ -47,6 +47,9 @@ pub fn parse_line(line: &str) -> Result<SourceLine, String> {
     if let Some(rest) = strip_keyword(trimmed, "seed") {
         return parse_seed(rest);
     }
+    if let Some(rest) = strip_keyword(trimmed, "meta") {
+        return parse_meta(rest);
+    }
     // Early builds used `use`; keep it as a parse-compatible alias while all
     // diagnostics and documentation point to the clearer `include` spelling.
     if let Some(rest) = strip_keyword(trimmed, "use") {
@@ -203,6 +206,32 @@ fn parse_tail(input: &str) -> Result<SourceLine, String> {
         return Err(format!("tail: expected zero or more seconds, got '{raw}'"));
     }
     Ok(SourceLine::Tail(seconds))
+}
+
+/// `meta <key> "<value>"` — a free-form tag carried with the piece (§8.10).
+///
+/// The key set is open on purpose: a piece knows things about itself that the
+/// language has no business enumerating, and a renderer can pass them straight
+/// through to the file it writes.
+fn parse_meta(input: &str) -> Result<SourceLine, String> {
+    let input = input.trim();
+    let (key, rest) = match input.split_once(char::is_whitespace) {
+        Some(split) => split,
+        None => return Err(format!("meta: expected a value after '{input}'")),
+    };
+    validate_identifier(key).map_err(|error| format!("meta: {error}"))?;
+    let rest = rest.trim();
+    let value = rest
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .ok_or_else(|| format!("meta: the value must be double-quoted, got '{rest}'"))?;
+    if value.contains('"') {
+        return Err("meta: the value cannot contain a double quote".to_string());
+    }
+    Ok(SourceLine::Meta(
+        key.to_ascii_lowercase(),
+        value.to_string(),
+    ))
 }
 
 /// `seed <integer>` — salts the generative constructs (§8.8).

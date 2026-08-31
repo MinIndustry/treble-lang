@@ -567,3 +567,48 @@ fn the_spec_example_resolves() {
     assert_eq!(main.audible_on(16).count(), 4);
     assert_eq!(main.audible_on(15).count(), 3);
 }
+
+// --- Metadata (§8.9) ---
+
+#[test]
+fn metadata_travels_with_the_piece() {
+    let piece = piece(
+        "meta title \"Drift\"\nmeta composer \"A. N. Other\"\nsection a 4 {\n  x kick \"x\"\n}\n",
+    );
+    assert_eq!(piece.meta("title"), Some("Drift"));
+    assert_eq!(piece.meta("composer"), Some("A. N. Other"));
+    assert_eq!(piece.metadata.len(), 2);
+}
+
+#[test]
+fn a_repeated_key_replaces_rather_than_accumulates() {
+    // Editing a title must not leave the previous one in the output.
+    let piece =
+        piece("meta title \"First\"\nmeta title \"Second\"\nsection a 4 {\n  x kick \"x\"\n}\n");
+    assert_eq!(piece.meta("title"), Some("Second"));
+    assert_eq!(piece.metadata.len(), 1);
+}
+
+#[test]
+fn keys_are_case_insensitive() {
+    let piece = piece("meta Title \"Drift\"\nsection a 4 {\n  x kick \"x\"\n}\n");
+    assert_eq!(piece.meta("title"), Some("Drift"));
+}
+
+#[test]
+fn an_unquoted_or_unterminated_value_is_refused() {
+    assert_complains(
+        "meta title Drift\nsection a 4 {\n}\n",
+        "must be double-quoted",
+    );
+    assert_complains("meta title\nsection a 4 {\n}\n", "expected a value");
+}
+
+#[test]
+fn metadata_is_inert_in_a_live_buffer() {
+    let mut session = Session::new();
+    let result = session.evaluate("meta title \"A performance\"\nkick kick \"x ~ x ~\"\n");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    // It changes no sound, so it produces no delta beyond the pattern itself.
+    assert_eq!(result.deltas.len(), 1);
+}

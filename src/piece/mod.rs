@@ -92,6 +92,9 @@ pub struct Piece {
     /// Sections the arrangement never plays. Legal — a sketch is not an error
     /// — but worth reporting, so it is surfaced rather than swallowed.
     pub unused: Vec<String>,
+    /// `meta` tags in source order (§8.10). Free-form: the language does not
+    /// enumerate the keys, it only carries them.
+    pub metadata: Vec<(String, String)>,
 }
 
 /// The default `tail` when a piece does not set one (§8.7).
@@ -115,6 +118,14 @@ impl Piece {
             .iter()
             .map(|occurrence| self.sections[occurrence.section].seconds())
             .sum()
+    }
+
+    /// The value of a `meta` tag, if the piece sets one.
+    pub fn meta(&self, key: &str) -> Option<&str> {
+        self.metadata
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
     }
 
     /// How long a render lasts: the arrangement plus its tail.
@@ -212,6 +223,7 @@ pub fn resolve(
     let mut arrangement: Option<Vec<ArrangeItem>> = None;
     let mut tail = DEFAULT_TAIL;
     let mut seed = 0u64;
+    let mut metadata: Vec<(String, String)> = Vec::new();
 
     // The section being filled, and the ambient state to restore when it ends.
     let mut open: Option<(Section, Ambient)> = None;
@@ -243,6 +255,12 @@ pub fn resolve(
             }
             SourceLine::Tail(seconds) => tail = *seconds,
             SourceLine::Seed(value) => seed = *value,
+            SourceLine::Meta(key, value) => {
+                // A repeated key replaces rather than accumulates, so editing a
+                // title does not leave the old one behind in the output.
+                metadata.retain(|(existing, _)| existing != key);
+                metadata.push((key.clone(), value.clone()));
+            }
             SourceLine::Arrange(items) => {
                 if arrangement.is_some() {
                     errors.push(error(
@@ -362,6 +380,7 @@ pub fn resolve(
             tail,
             seed,
             unused,
+            metadata,
         },
         errors,
     )
