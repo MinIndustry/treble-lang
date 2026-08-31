@@ -6,8 +6,10 @@
 pub mod ast;
 pub mod error;
 pub mod parser;
+pub mod piece;
 pub mod session;
 
-pub use ast::{MiniNotation, PatternDef, Program, SourceLine};
+pub use ast::{MiniNotation, PatternDef, Program, SourceLine, Span};
 pub use error::{CompileError, CompileErrorKind, SourceLocation};
+pub use piece::{Piece, Section};
 pub use session::Session;

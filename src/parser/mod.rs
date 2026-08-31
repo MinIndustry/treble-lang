@@ -32,6 +32,9 @@ pub fn parse_program(source: &str) -> (Program, Vec<CompileError>) {
     // The group currently open, if any. Group members stay ordinary lines;
     // only their `group` tag records the membership.
     let mut open_group: Option<(usize, String)> = None;
+    // The section currently open, if any. A group nests one level inside a
+    // section, so both can be open at once and a `}` closes the inner one.
+    let mut open_section: Option<(usize, String)> = None;
 
     let report = |errors: &mut Vec<CompileError>, line: usize, message: String| {
         errors.push(CompileError {
@@ -74,6 +77,15 @@ pub fn parse_program(source: &str) -> (Program, Vec<CompileError>) {
                     line_idx + 1,
                     format!("def: an instrument definition cannot live inside group '{group}'"),
                 );
+            } else if let Some((_, section)) = &open_section {
+                report(
+                    &mut errors,
+                    line_idx + 1,
+                    format!(
+                        "def: an instrument definition cannot live inside section '{section}' \
+                         — move it above the section"
+                    ),
+                );
             }
             depth = count_braces(raw, '{');
             depth -= count_braces(raw, '}').min(depth);
@@ -106,18 +118,75 @@ pub fn parse_program(source: &str) -> (Program, Vec<CompileError>) {
                         open_group = Some((line_idx, name.clone()));
                         lines.push(SourceLine::GroupStart { muted, name });
                     }
+                    // A `}` closes the innermost open block: the group if one
+                    // is open, otherwise the section.
                     SourceLine::GroupEnd(transforms) => {
-                        if open_group.take().is_none() {
+                        if open_group.take().is_some() {
+                            lines.push(SourceLine::GroupEnd(transforms));
+                        } else if open_section.take().is_some() {
+                            if !transforms.is_empty() {
+                                report(
+                                    &mut errors,
+                                    line_idx + 1,
+                                    "section: '}' takes no filters — a section is a span of \
+                                     time, not a bus; put them on a group inside it"
+                                        .to_string(),
+                                );
+                            }
+                            lines.push(SourceLine::SectionEnd);
+                        } else {
                             report(
                                 &mut errors,
                                 line_idx + 1,
-                                "group: '}' without an open group".to_string(),
+                                "'}' without an open group or section".to_string(),
+                            );
+                            lines.push(SourceLine::GroupEnd(transforms));
+                        }
+                    }
+                    SourceLine::SectionStart {
+                        muted,
+                        name,
+                        cycles,
+                    } => {
+                        if let Some((_, group)) = &open_group {
+                            report(
+                                &mut errors,
+                                line_idx + 1,
+                                format!(
+                                    "section: '{name}' cannot open inside group '{group}' — a \
+                                     group nests inside a section, not the other way round"
+                                ),
+                            );
+                        } else if let Some((_, outer)) = &open_section {
+                            report(
+                                &mut errors,
+                                line_idx + 1,
+                                format!("section: sections don't nest; '{outer}' is still open"),
                             );
                         }
-                        lines.push(SourceLine::GroupEnd(transforms));
+                        open_section = Some((line_idx, name.clone()));
+                        lines.push(SourceLine::SectionStart {
+                            muted,
+                            name,
+                            cycles,
+                        });
                     }
+                    SourceLine::SectionEnd => lines.push(SourceLine::SectionEnd),
                     SourceLine::Pattern(mut def) => {
                         def.group = open_group.as_ref().map(|(_, name)| name.clone());
+                        def.section = open_section.as_ref().map(|(_, name)| name.clone());
+                        if def.span.is_some() && def.section.is_none() {
+                            report(
+                                &mut errors,
+                                line_idx + 1,
+                                format!(
+                                    "'{}': a span needs a section — its cycles are counted \
+                                     from the section's start (§8.3)",
+                                    def.name
+                                ),
+                            );
+                            def.span = None;
+                        }
                         lines.push(SourceLine::Pattern(def));
                     }
                     // A group holds patterns; a directive inside one would
@@ -127,7 +196,10 @@ pub fn parse_program(source: &str) -> (Program, Vec<CompileError>) {
                     | SourceLine::Phrase(_)
                     | SourceLine::Scale(_, _)
                     | SourceLine::Load(_)
-                    | SourceLine::Include(_))
+                    | SourceLine::Include(_)
+                    | SourceLine::Arrange(_)
+                    | SourceLine::Tail(_)
+                    | SourceLine::Seed(_))
                         if open_group.is_some() =>
                     {
                         report(
@@ -135,6 +207,29 @@ pub fn parse_program(source: &str) -> (Program, Vec<CompileError>) {
                             line_idx + 1,
                             "group: directives cannot live inside a group — move this above it"
                                 .to_string(),
+                        );
+                        lines.push(directive);
+                    }
+                    // A section scopes `bpm`, `sig` and `scale` (§8.5). The
+                    // rest configure the whole buffer, so a section is the
+                    // wrong place to write them and they are refused rather
+                    // than silently applied to everything.
+                    directive @ (SourceLine::Phrase(_)
+                    | SourceLine::Load(_)
+                    | SourceLine::Include(_)
+                    | SourceLine::Arrange(_)
+                    | SourceLine::Tail(_)
+                    | SourceLine::Seed(_))
+                        if open_section.is_some() =>
+                    {
+                        report(
+                            &mut errors,
+                            line_idx + 1,
+                            format!(
+                                "section: '{}' configures the whole piece — move it above the \
+                                 section (a section scopes only bpm, sig and scale)",
+                                directive_keyword(&directive)
+                            ),
                         );
                         lines.push(directive);
                     }
@@ -157,6 +252,14 @@ pub fn parse_program(source: &str) -> (Program, Vec<CompileError>) {
         );
     }
 
+    if let Some((start, name)) = open_section {
+        report(
+            &mut errors,
+            start + 1,
+            format!("section: '{name}' is never closed with '}}'"),
+        );
+    }
+
     if let Some((start, collected)) = block {
         report(
             &mut errors,
@@ -169,6 +272,22 @@ pub fn parse_program(source: &str) -> (Program, Vec<CompileError>) {
     }
 
     (Program { lines }, errors)
+}
+
+/// The keyword a directive was written with, for diagnostics.
+fn directive_keyword(line: &SourceLine) -> &'static str {
+    match line {
+        SourceLine::Bpm(_) => "bpm",
+        SourceLine::Sig(_, _) => "sig",
+        SourceLine::Phrase(_) => "phrase",
+        SourceLine::Scale(_, _) => "scale",
+        SourceLine::Load(_) => "load",
+        SourceLine::Include(_) => "include",
+        SourceLine::Arrange(_) => "arrange",
+        SourceLine::Tail(_) => "tail",
+        SourceLine::Seed(_) => "seed",
+        _ => "directive",
+    }
 }
 
 #[cfg(test)]

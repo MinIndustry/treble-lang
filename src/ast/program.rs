@@ -21,6 +21,12 @@ pub enum SourceLine {
     Scale(PitchRoot, ScaleMode),
     /// `load "<path>"`
     Load(String),
+    /// `arrange <name> [<name> …]` — the order the sections play in (§8.4).
+    Arrange(Vec<ArrangeItem>),
+    /// `tail <seconds>` — how long a render rings out past the last cycle (§8.7).
+    Tail(f64),
+    /// `seed <integer>` — salts the generative constructs (§8.8).
+    Seed(u64),
     /// `include <instrument>` — explicitly make a registry instrument available.
     Include(String),
     /// A `def <name> { … }` instrument definition (§6).
@@ -37,6 +43,18 @@ pub enum SourceLine {
     GroupStart { muted: bool, name: String },
     /// `}` closing a group, optionally with `| transform` shared filters.
     GroupEnd(Vec<Transform>),
+    /// `[;] section <name> <cycles> {` — opens a section (§8.2). Like a group,
+    /// the members stay ordinary [`SourceLine`]s so line-based editing keeps
+    /// working; [`parse_program`](crate::parser::parse_program) tags each
+    /// member's [`PatternDef::section`].
+    SectionStart {
+        muted: bool,
+        name: String,
+        cycles: u32,
+    },
+    /// `}` closing a section. Unlike a group's, it takes no pipeline — a
+    /// section is a span of time, not a bus.
+    SectionEnd,
     /// A comment (kept for round-tripping, not evaluated).
     Comment(String),
     /// An empty/blank line.
@@ -54,7 +72,8 @@ pub struct GroupDef {
     pub transforms: Vec<Transform>,
 }
 
-/// A pattern definition: `[;] <name> <instrument> "<mini>" [| transform ...]`
+/// A pattern definition:
+/// `[;] <name> <instrument> "<mini>" [@ span] [| transform ...]`
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatternDef {
     pub muted: bool,
@@ -65,6 +84,98 @@ pub struct PatternDef {
     /// The group this line sits inside, if any — assigned by
     /// [`parse_program`](crate::parser::parse_program), not by the line itself.
     pub group: Option<String>,
+    /// The section this line sits inside, if any — likewise assigned by
+    /// [`parse_program`](crate::parser::parse_program). `None` in a live
+    /// buffer, and in a piece means a top-level line that sounds throughout.
+    pub section: Option<String>,
+    /// `@ 3..8` — where in its section the line sounds (§8.3). `None` is the
+    /// whole section. Only legal on a section member.
+    pub span: Option<Span>,
+}
+
+/// An instrument section (§8.2): a named block of a stated length in cycles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionDef {
+    /// A muted section still takes its time in the arrangement — it is a rest
+    /// of its own length, not a removal from it.
+    pub muted: bool,
+    pub name: String,
+    /// How many cycles the section lasts. Always >= 1.
+    pub cycles: u32,
+}
+
+/// One entry in an `arrange` line: a section and how many times in a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrangeItem {
+    pub section: String,
+    /// `verse*2`. Always >= 1; a bare name is 1.
+    pub repeat: u32,
+}
+
+/// Where a line sounds inside its section — `@ 3..8`, `@ 5..`, `@ ..4`, `@ 8`.
+///
+/// Cycles are **1-based and inclusive at both ends**, matching how `a..b` reads
+/// everywhere else in the language and how a musician counts bars. Either end
+/// may be omitted, meaning the section's own start or end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub from: Option<u32>,
+    pub to: Option<u32>,
+}
+
+impl Span {
+    /// A single cycle: `@ 8`.
+    pub fn at(cycle: u32) -> Self {
+        Self {
+            from: Some(cycle),
+            to: Some(cycle),
+        }
+    }
+
+    /// The first cycle the line sounds on, resolved against its section.
+    pub fn start(&self) -> u32 {
+        self.from.unwrap_or(1)
+    }
+
+    /// The last cycle the line sounds on, resolved against a section of
+    /// `cycles` length.
+    pub fn end(&self, cycles: u32) -> u32 {
+        self.to.unwrap_or(cycles)
+    }
+
+    /// Whether the line sounds on `cycle` (1-based) of a section of `cycles`
+    /// length.
+    pub fn contains(&self, cycle: u32, cycles: u32) -> bool {
+        cycle >= self.start() && cycle <= self.end(cycles)
+    }
+
+    /// Why this span could never sound in a section of `cycles` length, if so.
+    ///
+    /// A line that can never sound is a mistake rather than a silence, so the
+    /// two ways of writing one are reported rather than played as a rest.
+    pub fn conflict(&self, cycles: u32) -> Option<String> {
+        if let (Some(from), Some(to)) = (self.from, self.to)
+            && from > to
+        {
+            return Some(format!("span starts at cycle {from} but ends at {to}"));
+        }
+        if self.start() == 0 {
+            return Some("cycle 0: spans are 1-based".to_string());
+        }
+        let last = self.end(cycles);
+        if last > cycles {
+            return Some(format!(
+                "span reaches cycle {last}, past the section's {cycles}"
+            ));
+        }
+        if self.start() > cycles {
+            return Some(format!(
+                "span starts at cycle {}, past the section's {cycles}",
+                self.start()
+            ));
+        }
+        None
+    }
 }
 
 /// A pitch root (for scales/directives) — uppercase, with optional accidental.
@@ -283,6 +394,18 @@ pub enum Ramp<T> {
     ///
     /// Split into head and tail so the sequence can never be empty.
     Steps { first: T, rest: Vec<T> },
+    /// `r(...)` — a travel that carries its own window instead of inheriting
+    /// the line's `| ramp`: a span in **time divisions** (the signature's
+    /// beats) and its own curve. In 4/4, `r(300,9000,4)` spans one cycle; in
+    /// 2/4 the same span is two. Written without internal spaces.
+    Timed {
+        /// The travel itself — always `Sweep` or `Steps`.
+        ramp: Box<Ramp<T>>,
+        /// Window length in time divisions. Fractions are legal: `0.5` is
+        /// half a beat, which with `osc` is a wobble.
+        span_divisions: f64,
+        curve: RampCurve,
+    },
 }
 
 impl<T: Copy> Ramp<T> {
@@ -305,6 +428,7 @@ impl<T: Copy> Ramp<T> {
             Self::Fixed(value) => *value,
             Self::Sweep { from, .. } => *from,
             Self::Steps { first, .. } => *first,
+            Self::Timed { ramp, .. } => ramp.start(),
         }
     }
 
@@ -323,6 +447,19 @@ impl<T: Copy> Ramp<T> {
                 all.extend(rest.iter().copied());
                 all
             }
+            Self::Timed { ramp, .. } => ramp.values(),
+        }
+    }
+
+    /// The window a `r(...)` value carries, if it has one of its own.
+    pub fn own_window(&self) -> Option<(f64, RampCurve)> {
+        match self {
+            Self::Timed {
+                span_divisions,
+                curve,
+                ..
+            } => Some((*span_divisions, *curve)),
+            _ => None,
         }
     }
 }

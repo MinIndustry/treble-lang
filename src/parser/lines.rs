@@ -38,6 +38,15 @@ pub fn parse_line(line: &str) -> Result<SourceLine, String> {
     if let Some(rest) = strip_keyword(trimmed, "include") {
         return parse_include(rest);
     }
+    if let Some(rest) = strip_keyword(trimmed, "arrange") {
+        return parse_arrange(rest);
+    }
+    if let Some(rest) = strip_keyword(trimmed, "tail") {
+        return parse_tail(rest);
+    }
+    if let Some(rest) = strip_keyword(trimmed, "seed") {
+        return parse_seed(rest);
+    }
     // Early builds used `use`; keep it as a parse-compatible alias while all
     // diagnostics and documentation point to the clearer `include` spelling.
     if let Some(rest) = strip_keyword(trimmed, "use") {
@@ -48,6 +57,13 @@ pub fn parse_line(line: &str) -> Result<SourceLine, String> {
     if trimmed == "group" || strip_keyword(trimmed, "group").is_some() {
         return parse_group_header(trimmed, false);
     }
+    // Section markers (§8.2). `section` is reserved the same way.
+    if trimmed == "section" || strip_keyword(trimmed, "section").is_some() {
+        return parse_section_header(trimmed, false);
+    }
+    // A bare `}` closes whichever block is open; only a group's may carry a
+    // pipeline, so the line parser reads the general form and
+    // [`parse_program`](super::parse_program) decides which block it ends.
     if let Some(rest) = trimmed.strip_prefix('}') {
         return parse_group_footer(rest);
     }
@@ -57,6 +73,9 @@ pub fn parse_line(line: &str) -> Result<SourceLine, String> {
         let rest = rest.trim_start();
         if rest == "group" || strip_keyword(rest, "group").is_some() {
             return parse_group_header(rest, true);
+        }
+        if rest == "section" || strip_keyword(rest, "section").is_some() {
+            return parse_section_header(rest, true);
         }
         return parse_pattern_line(rest, true);
     }
@@ -79,6 +98,41 @@ fn parse_group_header(line: &str, muted: bool) -> Result<SourceLine, String> {
     Ok(SourceLine::GroupStart {
         muted,
         name: name.to_string(),
+    })
+}
+
+/// `[;] section <name> <cycles> {` — the length is stated, not inferred (§8.2).
+fn parse_section_header(line: &str, muted: bool) -> Result<SourceLine, String> {
+    let rest = strip_keyword(line, "section")
+        .ok_or_else(|| "section: expected 'section <name> <cycles> {'".to_string())?;
+    let Some(body) = rest.strip_suffix('{') else {
+        return Err("section: the header must end with '{'".to_string());
+    };
+    let mut parts = body.split_whitespace();
+    let name = parts
+        .next()
+        .ok_or_else(|| "section: expected a name before the length".to_string())?;
+    validate_identifier(name).map_err(|error| format!("section: {error}"))?;
+    let Some(cycles) = parts.next() else {
+        return Err(format!(
+            "section: '{name}' needs a length in cycles — 'section {name} 16 {{'"
+        ));
+    };
+    let cycles: u32 = cycles
+        .parse()
+        .map_err(|_| format!("section: expected a length in cycles, got '{cycles}'"))?;
+    if cycles == 0 {
+        return Err("section: a section lasts at least one cycle".to_string());
+    }
+    if let Some(extra) = parts.next() {
+        return Err(format!(
+            "section: unexpected '{extra}' after the length (filters go on the member lines)"
+        ));
+    }
+    Ok(SourceLine::SectionStart {
+        muted,
+        name: name.to_string(),
+        cycles,
     })
 }
 
@@ -108,6 +162,57 @@ fn strip_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
 }
 
 // --- Directive parsers ---
+
+/// `arrange <name> [<name>*N …]` — the order the sections play in (§8.4).
+fn parse_arrange(input: &str) -> Result<SourceLine, String> {
+    let mut items = Vec::new();
+    for token in input.split_whitespace() {
+        let (name, repeat) = match token.split_once('*') {
+            Some((name, count)) => {
+                let repeat: u32 = count.parse().map_err(|_| {
+                    format!("arrange: expected a repeat count after '*', got '{count}'")
+                })?;
+                if repeat == 0 {
+                    return Err(format!(
+                        "arrange: '{name}*0' plays nothing — drop it from the line instead"
+                    ));
+                }
+                (name, repeat)
+            }
+            None => (token, 1),
+        };
+        validate_identifier(name).map_err(|error| format!("arrange: {error}"))?;
+        items.push(ArrangeItem {
+            section: name.to_string(),
+            repeat,
+        });
+    }
+    if items.is_empty() {
+        return Err("arrange: expected at least one section name".to_string());
+    }
+    Ok(SourceLine::Arrange(items))
+}
+
+/// `tail <seconds>` — how long a render rings out past the last cycle (§8.7).
+fn parse_tail(input: &str) -> Result<SourceLine, String> {
+    let raw = input.trim();
+    let seconds: f64 = raw
+        .parse()
+        .map_err(|_| format!("tail: expected a number of seconds, got '{raw}'"))?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(format!("tail: expected zero or more seconds, got '{raw}'"));
+    }
+    Ok(SourceLine::Tail(seconds))
+}
+
+/// `seed <integer>` — salts the generative constructs (§8.8).
+fn parse_seed(input: &str) -> Result<SourceLine, String> {
+    let raw = input.trim();
+    let seed: u64 = raw
+        .parse()
+        .map_err(|_| format!("seed: expected a non-negative integer, got '{raw}'"))?;
+    Ok(SourceLine::Seed(seed))
+}
 
 /// `phrase <cycles>` — the unit changes are quantised to.
 ///
@@ -223,18 +328,75 @@ fn parse_pattern_line(input: &str, muted: bool) -> Result<SourceLine, String> {
     let inner = &notation_str[1..notation_str.len() - 1];
     let notation = parse_mini(inner)?;
 
-    // Parse transforms: everything after the closing quote, split by `|`
+    // Everything after the closing quote: an optional `@ span`, then the `|`
+    // pipeline. The span's position is fixed rather than free (§8.3) — it says
+    // when the line exists, not what happens to it, so it stays adjacent to the
+    // notation and leaves the pipeline contiguous.
     let remainder: String = tokens.collect::<Vec<&str>>().join(" ");
-    let transforms = parse_transforms(remainder.trim())?;
+    let (span, rest) = split_span(remainder.trim())?;
+    let transforms = parse_transforms(rest.trim())?;
 
     Ok(SourceLine::Pattern(PatternDef {
         group: None,
+        section: None,
+        span,
         muted,
         name: name.to_string(),
         instrument: instrument.to_string(),
         notation,
         transforms,
     }))
+}
+
+/// Split a leading `@ <span>` off the tail of a pattern line, returning it and
+/// whatever pipeline follows.
+fn split_span(input: &str) -> Result<(Option<Span>, &str), String> {
+    let Some(rest) = input.strip_prefix('@') else {
+        return Ok((None, input));
+    };
+    let rest = rest.trim_start();
+    // The span runs to the first `|`, or to the end of the line.
+    let (body, tail) = match rest.find('|') {
+        Some(index) => rest.split_at(index),
+        None => (rest, ""),
+    };
+    Ok((Some(parse_span(body.trim())?), tail))
+}
+
+/// `3..8`, `5..`, `..4`, `8` — 1-based, both ends inclusive, either omittable.
+fn parse_span(body: &str) -> Result<Span, String> {
+    if body.is_empty() {
+        return Err("span: expected a cycle after '@' — '@ 8' or '@ 3..8'".to_string());
+    }
+    let cycle = |raw: &str| -> Result<u32, String> {
+        raw.parse::<u32>()
+            .map_err(|_| format!("span: expected a cycle number, got '{raw}'"))
+    };
+    let Some((from, to)) = body.split_once("..") else {
+        // A bare `@ n` is the single cycle n.
+        return Ok(Span::at(cycle(body)?));
+    };
+    let (from, to) = (from.trim(), to.trim());
+    if to.contains("..") {
+        return Err(format!("span: '{body}' has more than two ends"));
+    }
+    if from.is_empty() && to.is_empty() {
+        return Err(
+            "span: '@ ..' names no cycles — drop it to sound for the whole section".to_string(),
+        );
+    }
+    Ok(Span {
+        from: if from.is_empty() {
+            None
+        } else {
+            Some(cycle(from)?)
+        },
+        to: if to.is_empty() {
+            None
+        } else {
+            Some(cycle(to)?)
+        },
+    })
 }
 
 fn validate_identifier(s: &str) -> Result<(), String> {
@@ -599,15 +761,35 @@ fn parse_transform_ramp(
     })
 }
 
-/// `4`, `4..16` or `2>4>8>16`, from one whitespace-delimited argument.
+/// `4`, `4..16`, `2>4>8>16` or `r(...)`, from one whitespace-delimited
+/// argument.
 ///
-/// The two spellings mean different things, so mixing them in one argument is
-/// an error rather than a guess.
-fn ramp_from_text<T: Copy>(
+/// The two range spellings mean different things, so mixing them in one
+/// argument is an error rather than a guess.
+pub(crate) fn ramp_from_text<T: Copy>(
     text: &str,
     name: &str,
     parse: impl Fn(&str) -> Result<T, String>,
 ) -> Result<Ramp<T>, String> {
+    ramp_from_text_dyn(text, name, &parse)
+}
+
+/// The `dyn` layer: `r(...)` re-enters ramp parsing for its range argument,
+/// and a generic closure parameter would nest a new type each level.
+fn ramp_from_text_dyn<T: Copy>(
+    text: &str,
+    name: &str,
+    parse: &dyn Fn(&str) -> Result<T, String>,
+) -> Result<Ramp<T>, String> {
+    if let Some(inner) = text.strip_prefix("r(") {
+        let Some(inner) = inner.strip_suffix(')') else {
+            return Err(format!(
+                "{name}: '{text}' does not close its parenthesis — r(...) is written \
+                 without spaces, e.g. r(300,9000,4,exp)"
+            ));
+        };
+        return timed_ramp_from_args(inner, name, &parse);
+    }
     let sweeps = text.contains("..");
     let steps = text.contains('>');
     if sweeps && steps {
@@ -630,6 +812,72 @@ fn ramp_from_text<T: Copy>(
     let first = parse(stages.next().unwrap_or_default())?;
     let rest = stages.map(parse).collect::<Result<Vec<T>, String>>()?;
     Ok(Ramp::steps(first, rest))
+}
+
+/// The inside of `r(...)`: a range, then optionally a span in time divisions
+/// and a curve. `r(300,9000)` is plain `300..9000`; `r(300,9000,4)` carries
+/// its own four-beat window; `r(2>4>8,6,osc)` cycles its stages.
+fn timed_ramp_from_args<T: Copy>(
+    inner: &str,
+    name: &str,
+    parse: &dyn Fn(&str) -> Result<T, String>,
+) -> Result<Ramp<T>, String> {
+    let args: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if args.iter().any(|arg| arg.is_empty()) {
+        return Err(format!("{name}: r(...) has an empty argument"));
+    }
+
+    // The range: one leading argument spelt `a..b`/`a>b>c`, or two arguments
+    // read as `from,to`.
+    let (ramp, rest) = if args[0].contains("..") || args[0].contains('>') {
+        (ramp_from_text_dyn(args[0], name, parse)?, &args[1..])
+    } else if args.len() >= 2 {
+        let from = parse(args[0])?;
+        let to = parse(args[1])?;
+        (Ramp::Sweep { from, to }, &args[2..])
+    } else {
+        return Err(format!(
+            "{name}: r(...) needs a travel — r(from,to), r(a..b) or r(a>b>c)"
+        ));
+    };
+    if !ramp.travels() {
+        return Err(format!("{name}: r(...) needs a travel, not a single value"));
+    }
+
+    let mut rest = rest.iter();
+    let Some(span_text) = rest.next() else {
+        // No span of its own: plain sugar, the line's `| ramp` governs it.
+        return Ok(ramp);
+    };
+    let span_divisions: f64 = span_text.parse().map_err(|_| {
+        format!("{name}: r(...) span '{span_text}' is not a number of time divisions")
+    })?;
+    if !span_divisions.is_finite() || span_divisions <= 0.0 {
+        return Err(format!(
+            "{name}: r(...) span must be a positive number of time divisions"
+        ));
+    }
+    let curve = match rest.next().copied() {
+        None => RampCurve::Linear,
+        Some("lin") => RampCurve::Linear,
+        Some("exp") => RampCurve::Exponential,
+        Some("osc") => RampCurve::Oscillate,
+        Some(other) => {
+            return Err(format!(
+                "{name}: r(...) style '{other}' is not a curve; use 'lin' (the default), 'exp' or 'osc'"
+            ));
+        }
+    };
+    if let Some(extra) = rest.next() {
+        return Err(format!(
+            "{name}: r(...) has an unexpected argument '{extra}'"
+        ));
+    }
+    Ok(Ramp::Timed {
+        ramp: Box::new(ramp),
+        span_divisions,
+        curve,
+    })
 }
 
 /// Every value a ramp passes through has to be legal, not only the one it
@@ -1395,6 +1643,58 @@ mod tests {
             }]
         );
         assert_eq!(RampCurve::default(), RampCurve::Linear);
+    }
+
+    #[test]
+    fn test_r_form_without_a_span_is_plain_sugar() {
+        assert_eq!(
+            transforms("p pad \"0\" | vel r(0.4,1.0)"),
+            transforms("p pad \"0\" | vel 0.4..1.0")
+        );
+        assert_eq!(
+            transforms("p pad \"0\" | vel r(0.4>0.6>1.0)"),
+            transforms("p pad \"0\" | vel 0.4>0.6>1.0")
+        );
+    }
+
+    #[test]
+    fn test_r_form_with_a_span_carries_its_own_window() {
+        let parsed = transforms("p pad \"0\" | vel r(0.4,1.0,4,osc)");
+        assert_eq!(
+            parsed,
+            vec![Transform::Vel(Ramp::Timed {
+                ramp: Box::new(Ramp::Sweep { from: 0.4, to: 1.0 }),
+                span_divisions: 4.0,
+                curve: RampCurve::Oscillate,
+            })]
+        );
+        // The style defaults to lin, and fractions of a division are legal.
+        assert_eq!(
+            transforms("p pad \"0\" | vel r(0.4,1.0,0.5)"),
+            vec![Transform::Vel(Ramp::Timed {
+                ramp: Box::new(Ramp::Sweep { from: 0.4, to: 1.0 }),
+                span_divisions: 0.5,
+                curve: RampCurve::Linear,
+            })]
+        );
+    }
+
+    #[test]
+    fn test_r_form_still_range_checks_its_travel() {
+        let error = parse_line("p pad \"0\" | vel r(0.4,2.0,4)").unwrap_err();
+        assert!(error.contains("outside the supported range"), "{error}");
+    }
+
+    #[test]
+    fn test_r_form_errors_are_specific() {
+        let error = parse_line("p pad \"0\" | vel r(0.4, 1.0, 4)").unwrap_err();
+        assert!(error.contains("without spaces"), "{error}");
+        let error = parse_line("p pad \"0\" | vel r(0.5)").unwrap_err();
+        assert!(error.contains("needs a travel"), "{error}");
+        let error = parse_line("p pad \"0\" | vel r(0.4,1.0,4,sine)").unwrap_err();
+        assert!(error.contains("'sine' is not a curve"), "{error}");
+        let error = parse_line("p pad \"0\" | vel r(0.4,1.0,exp)").unwrap_err();
+        assert!(error.contains("time divisions"), "{error}");
     }
 
     #[test]

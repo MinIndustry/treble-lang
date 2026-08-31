@@ -528,6 +528,11 @@ fn parse_u32(input: &str) -> IResult<&str, u32> {
 /// the fraction needs a digit after its dot, and the second dot is not one.
 /// A `>` chain backtracks too, so the closing `>` of `<x*4>` is left alone.
 fn parse_ramp_u32(input: &str) -> IResult<&str, Ramp<u32>> {
+    if let Some(result) = parse_r_form(input, |part| {
+        part.parse::<u32>().map_err(|error| error.to_string())
+    }) {
+        return result;
+    }
     let (input, first) = parse_u32(input)?;
     if let Ok((rest, to)) = preceded(tag(".."), parse_u32).parse(input) {
         return Ok((rest, Ramp::Sweep { from: first, to }));
@@ -537,12 +542,39 @@ fn parse_ramp_u32(input: &str) -> IResult<&str, Ramp<u32>> {
 }
 
 fn parse_ramp_f64(input: &str) -> IResult<&str, Ramp<f64>> {
+    if let Some(result) = parse_r_form(input, |part| {
+        part.parse::<f64>().map_err(|error| error.to_string())
+    }) {
+        return result;
+    }
     let (input, first) = parse_f64(input)?;
     if let Ok((rest, to)) = preceded(tag(".."), parse_f64).parse(input) {
         return Ok((rest, Ramp::Sweep { from: first, to }));
     }
     let (input, steps) = many0(preceded(tag(">"), parse_f64)).parse(input)?;
     Ok((input, Ramp::steps(first, steps)))
+}
+
+/// `r(...)` wherever a ramp value is legal — `x(r(2,16,8),4)` grows a
+/// Euclidean count over its own eight-beat window. Written without spaces, so
+/// the closing parenthesis is unambiguous; the interpretation is shared with
+/// the transform parser.
+fn parse_r_form<T: Copy>(
+    input: &str,
+    parse: impl Fn(&str) -> Result<T, String>,
+) -> Option<IResult<&str, Ramp<T>>> {
+    let inner = input.strip_prefix("r(")?;
+    let close = inner.find(')')?;
+    let text = format!("r({})", &inner[..close]);
+    Some(
+        match crate::parser::lines::ramp_from_text(&text, "r", &parse) {
+            Ok(ramp) => Ok((&inner[close + 1..], ramp)),
+            Err(_) => Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Verify,
+            ))),
+        },
+    )
 }
 
 fn parse_f64(input: &str) -> IResult<&str, f64> {
@@ -559,6 +591,7 @@ fn parse_f64(input: &str) -> IResult<&str, f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::program::RampCurve;
     use pretty_assertions::assert_eq;
 
     // --- Helper to build notes quickly ---
@@ -575,6 +608,37 @@ mod tests {
     }
 
     // ---- Notes ----
+
+    #[test]
+    fn r_form_ranges_fit_inside_mini_notation() {
+        let m = parse_mini("x(r(2,16,8),4)").unwrap();
+        let modifiers = &m.sequence.steps[0].modifiers;
+        assert_eq!(
+            modifiers,
+            &vec![Modifier::Euclidean(
+                Ramp::Timed {
+                    ramp: Box::new(Ramp::Sweep { from: 2, to: 16 }),
+                    span_divisions: 8.0,
+                    curve: RampCurve::Linear,
+                },
+                Ramp::fixed(4),
+                None
+            )]
+        );
+
+        let m = parse_mini("x*r(2,8,4,osc)").unwrap();
+        assert_eq!(
+            m.sequence.steps[0].modifiers,
+            vec![Modifier::Repeat(Ramp::Timed {
+                ramp: Box::new(Ramp::Sweep { from: 2, to: 8 }),
+                span_divisions: 4.0,
+                curve: RampCurve::Oscillate,
+            })]
+        );
+
+        let m = parse_mini("x:r(0.3,1.0,2)").unwrap();
+        assert!(m.sequence.steps[0].velocity.as_ref().unwrap().travels());
+    }
 
     #[test]
     fn test_note_c4() {
