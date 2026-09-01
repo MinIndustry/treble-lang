@@ -163,6 +163,7 @@ mod tests {
             occurrences: 3,
             notes: 12,
             unused: Vec::new(),
+            telemetry: Default::default(),
         }
     }
 
