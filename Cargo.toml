@@ -1,6 +1,6 @@
 [package]
 name = "treble-lang"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 
 [dependencies]
@@ -9,7 +9,7 @@ nom = "8.0"
 # The language proper knows nothing about the engine, so both of these are
 # optional: parsing a buffer must not drag in a DSP stack. `render` turns on the
 # lowering half and the headless renderer that sits on it.
-treble = { version = "0.4.2", git = "https://github.com/MinIndustry/treble-core.git", tag = "0.4.2", optional = true }
+treble = { version = "0.4.3", git = "https://github.com/MinIndustry/treble-core.git", tag = "0.4.3", optional = true }
 hound = { version = "3.5", optional = true }
 rayon = { version = "1.12", optional = true }
 
