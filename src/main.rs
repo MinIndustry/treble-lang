@@ -358,7 +358,9 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     if json {
         println!(
             "{{\"path\":{:?},\"seconds\":{:.3},\"renderedSeconds\":{:.3},\"sampleRate\":{},\
-             \"sections\":{},\"occurrences\":{},\"cycles\":{},\"notes\":{},\"elapsed\":{:.3}}}",
+             \"sections\":{},\"occurrences\":{},\"cycles\":{},\"notes\":{},\"elapsed\":{:.3},\
+             \"islands\":{},\"slots\":{},\"workers\":{},\"preLimiterPeak\":{:.6},\
+             \"postLimiterPeak\":{:.6},\"maxGainReductionDb\":{:.3},\"limitedSamples\":{}}}",
             out.display().to_string(),
             rendered.seconds,
             rendered.rendered_seconds,
@@ -367,16 +369,34 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
             rendered.occurrences,
             piece.total_cycles(),
             rendered.notes,
-            elapsed
+            elapsed,
+            rendered.telemetry.islands,
+            rendered.telemetry.slots,
+            rendered.telemetry.worker_threads,
+            rendered.telemetry.pre_limiter_peak,
+            rendered.telemetry.post_limiter_peak,
+            rendered.telemetry.max_gain_reduction_db,
+            rendered.telemetry.limited_samples
         );
     } else if !quiet {
         eprintln!(
-            "wrote {}  ({}, {} notes, {:.1}× realtime)",
+            "wrote {}  ({}, {} notes, {:.1}× realtime, {} islands on {} workers)",
             out.display(),
             clock(rendered.rendered_seconds),
             rendered.notes,
-            rendered.rendered_seconds / elapsed.max(1e-9)
+            rendered.rendered_seconds / elapsed.max(1e-9),
+            rendered.telemetry.islands,
+            rendered.telemetry.worker_threads
         );
+        if rendered.telemetry.limited_samples > 0 {
+            eprintln!(
+                "  master: pre-limit {:.3}, peak {:.3}, max reduction {:.1} dB, {} limited samples",
+                rendered.telemetry.pre_limiter_peak,
+                rendered.telemetry.post_limiter_peak,
+                rendered.telemetry.max_gain_reduction_db,
+                rendered.telemetry.limited_samples
+            );
+        }
         for name in &rendered.unused {
             eprintln!("  note: section '{name}' is never played");
         }

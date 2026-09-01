@@ -5,7 +5,7 @@
 //! every note is scheduled at an absolute frame, and the graph is pulled a
 //! block at a time until the arrangement and its tail have gone by.
 //!
-//! ## One slot per occurrence
+//! ## Occurrence slots and render islands
 //!
 //! Every pattern of every *occurrence* gets its own instrument slot, rather
 //! than one slot per pattern name. Two things fall out of that, and both are
@@ -23,16 +23,21 @@
 //!   what "the section sounds the same wherever it is played" (§8.5, §8.6)
 //!   means once there are stateful filters in the chain.
 //!
-//! The cost is a slot per (occurrence, line), which an offline render can
-//! afford in a way the live engine could not.
+//! Slots are partitioned into independent render islands. Ungrouped lines from
+//! one occurrence run only for that occurrence plus its declared tail; lines
+//! sharing a named bus remain in one piece-wide island so the shared filter
+//! state is preserved. Offline islands use a fixed Rayon worker pool, then mix
+//! in declaration order through one master limiter for deterministic output.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, mpsc};
 
 use crate::ast::PatternDef;
 use crate::piece::{Piece, Section};
 use treble::app::prelude::{AudioGraph, AutomationSpec, AutomationTarget, BusSpec, ParameterRamp};
 use treble::audio::{EventScheduler, InstrumentAudioMessage, render_block};
-use treble::core::Note;
+use treble::core::graph::{AudioOutputSink, Entry, Sink, SinkTelemetry, System};
+use treble::core::{Block, Note};
 use treble::instruments::prelude::InstrumentRegistry;
 
 use super::compile::{
@@ -57,6 +62,20 @@ pub struct RenderedPiece {
     pub notes: usize,
     /// Sections the arrangement never played (§8.4).
     pub unused: Vec<String>,
+    /// Runtime and master-bus measurements from this render.
+    pub telemetry: RenderTelemetry,
+}
+
+/// Evidence about the work and headroom of an offline render.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RenderTelemetry {
+    pub islands: usize,
+    pub slots: usize,
+    pub worker_threads: usize,
+    pub pre_limiter_peak: f32,
+    pub post_limiter_peak: f32,
+    pub max_gain_reduction_db: f32,
+    pub limited_samples: usize,
 }
 
 /// One line of one occurrence, compiled and placed on the piece's timeline.
@@ -73,6 +92,37 @@ struct Placed {
     to_cycle: u32,
     /// The section's own length, for resolving an open-ended span.
     section_cycles: u32,
+}
+
+#[derive(Default)]
+struct IslandBuilder {
+    graph: AudioGraph,
+    placed: Vec<Placed>,
+    automations: Vec<AutomationSpec>,
+    bus_members: Vec<usize>,
+    bus: Option<(String, Vec<treble::instruments::spec::FxSpec>)>,
+    start_frame: u64,
+    end_frame: u64,
+}
+
+struct RenderIsland {
+    system: System,
+    scheduler: EventScheduler,
+    start_frame: u64,
+    end_frame: u64,
+}
+
+struct IslandAudio {
+    start_frame: u64,
+    samples: Vec<f32>,
+}
+
+enum WorkerMessage {
+    Advanced(u64),
+    Done {
+        index: usize,
+        result: Result<IslandAudio, String>,
+    },
 }
 
 /// Render a piece to interleaved stereo samples.
@@ -128,12 +178,12 @@ fn render_inner(
         return Err("the arrangement plays no section, so there is nothing to render".into());
     }
 
-    let mut graph = AudioGraph::new();
-    let mut placed: Vec<Placed> = Vec::new();
-    let mut automations: Vec<AutomationSpec> = Vec::new();
-    // Bus name -> the slots feeding it, across every occurrence. A bus is one
-    // bus for the whole piece (§8.2), so its members accumulate.
-    let mut bus_members: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let tail_frames = (piece.tail * f64::from(sample_rate)).round() as u64;
+    let mut occurrence_islands = Vec::new();
+    // Lines sharing a named bus stay in one piece-wide island. This preserves
+    // the bus's filter state while independent occurrence branches can sleep
+    // before their start and disappear after their tail.
+    let mut grouped_islands: BTreeMap<String, IslandBuilder> = BTreeMap::new();
     let mut bus_chains: BTreeMap<String, Vec<treble::instruments::spec::FxSpec>> = BTreeMap::new();
 
     let mut at_frame = 0u64;
@@ -144,37 +194,7 @@ fn render_inner(
         });
         let section = &piece.sections[occurrence.section];
         let cycle_frames = section_cycle_frames(section, sample_rate);
-
-        // A section is self-contained (§8.6): its lines' travels are measured
-        // from the start of *this* occurrence, so each playing sweeps alike.
-        let origin_cycle = occurrence.start_cycle;
-
-        let lines = section
-            .patterns
-            .iter()
-            .chain(&piece.throughout)
-            .filter(|line| !line.muted && !section.muted);
-
-        for line in lines {
-            let placed_line = mount_line(
-                &mut graph,
-                registry,
-                section,
-                line,
-                origin_cycle,
-                at_frame,
-                cycle_frames,
-                &mut automations,
-                piece.seed,
-            )?;
-            if let Some(group) = &line.group {
-                bus_members
-                    .entry(group.clone())
-                    .or_default()
-                    .push(placed_line.slot);
-            }
-            placed.push(placed_line);
-        }
+        let occurrence_frames = cycle_frames * u64::from(section.cycles);
 
         for group in &section.groups {
             if group.transforms.iter().any(transform_travels) {
@@ -190,8 +210,8 @@ fn render_inner(
                     section.cycle_seconds(),
                     LineTravel {
                         line: Travel::START,
-                        cycle: origin_cycle as f64,
-                        origin: origin_cycle,
+                        cycle: occurrence.start_cycle as f64,
+                        origin: occurrence.start_cycle,
                         divisions: section.sig.0,
                     },
                 )
@@ -200,61 +220,91 @@ fn render_inner(
             }
         }
 
-        at_frame += cycle_frames * u64::from(section.cycles);
+        // A section is self-contained (§8.6): its lines' travels are measured
+        // from the start of *this* occurrence, so each playing sweeps alike.
+        let origin_cycle = occurrence.start_cycle;
+
+        let lines = section
+            .patterns
+            .iter()
+            .chain(&piece.throughout)
+            .filter(|line| !line.muted && !section.muted);
+
+        let mut occurrence = IslandBuilder {
+            start_frame: at_frame,
+            end_frame: at_frame + occurrence_frames + tail_frames,
+            ..IslandBuilder::default()
+        };
+        for line in lines {
+            let island = if let Some(group) = &line.group {
+                grouped_islands
+                    .entry(group.clone())
+                    .or_insert_with(|| IslandBuilder {
+                        start_frame: 0,
+                        ..IslandBuilder::default()
+                    })
+            } else {
+                &mut occurrence
+            };
+            let placed_line = mount_line(
+                &mut island.graph,
+                registry,
+                section,
+                line,
+                origin_cycle,
+                at_frame,
+                cycle_frames,
+                &mut island.automations,
+                piece.seed,
+            )?;
+            if line.group.is_some() {
+                island.bus_members.push(placed_line.slot);
+            }
+            island.placed.push(placed_line);
+        }
+
+        if !occurrence.placed.is_empty() {
+            occurrence_islands.push(occurrence);
+        }
+        at_frame += occurrence_frames;
     }
 
-    let buses: Vec<BusSpec> = bus_members
-        .into_iter()
-        .map(|(name, members)| BusSpec {
-            fx: bus_chains.remove(&name).unwrap_or_default(),
-            name,
-            members,
-        })
-        .collect();
+    let arrangement_frames = at_frame;
+    let total_frames = arrangement_frames + tail_frames;
+    for (name, island) in &mut grouped_islands {
+        island.end_frame = total_frames;
+        island.bus = Some((name.clone(), bus_chains.remove(name).unwrap_or_default()));
+    }
     progress(Progress::Compiling {
         done: piece.timeline.len(),
         total: piece.timeline.len(),
     });
 
-    graph.set_buses(buses);
-    graph.set_automations(automations);
-
-    progress(Progress::Building {
-        slots: placed.len(),
-    });
-    let mut system = graph
-        .compile(sample_rate as f32)
-        .map_err(|error| format!("could not build the piece's audio graph: {error:?}"))?;
-
-    let mut scheduler = EventScheduler::new();
-    let notes = schedule(&mut scheduler, &placed, &graph);
-
-    let arrangement_frames = at_frame;
-    let total_frames = arrangement_frames + (piece.tail * f64::from(sample_rate)).round() as u64;
-
-    let mut samples: Vec<f32> = Vec::with_capacity(total_frames as usize * 2);
-    let mut frame = 0u64;
-    // Report about a hundred times over the render rather than per block: a
-    // block is a millisecond of audio and the reports would cost more than the
-    // rendering.
-    let report_every = (total_frames / 100).max(1);
-    let mut next_report = report_every;
-    while frame < total_frames {
-        frame = render_block(&mut system, &mut scheduler, frame, &mut samples);
-        if frame >= next_report {
-            progress(Progress::Rendering {
-                frames: frame.min(total_frames),
-                total_frames,
-            });
-            next_report = frame + report_every;
-        }
+    let builders = occurrence_islands
+        .into_iter()
+        .chain(grouped_islands.into_values())
+        .collect::<Vec<_>>();
+    let slots = builders.iter().map(|island| island.placed.len()).sum();
+    progress(Progress::Building { slots });
+    let mut notes = 0;
+    let mut islands = Vec::with_capacity(builders.len());
+    for builder in builders {
+        let (island, island_notes) = build_island(builder, sample_rate)?;
+        notes += island_notes;
+        islands.push(island);
     }
+
+    let island_count = islands.len();
+    let worker_threads = if island_count == 0 {
+        0
+    } else {
+        rayon::current_num_threads().min(island_count)
+    };
+    let rendered = render_islands(islands, total_frames, progress)?;
+    let (samples, master) = mix_and_limit(rendered, total_frames, sample_rate);
     progress(Progress::Done {
         frames: total_frames,
     });
-    // The last block overshoots whenever the total is not a multiple of the
-    // block size; trim rather than leaving a fraction of a block of tail.
-    samples.truncate(total_frames as usize * 2);
 
     Ok(RenderedPiece {
         sample_rate,
@@ -264,7 +314,190 @@ fn render_inner(
         occurrences: piece.timeline.len(),
         notes,
         unused: piece.unused.clone(),
+        telemetry: RenderTelemetry {
+            islands: island_count,
+            slots,
+            worker_threads,
+            pre_limiter_peak: master.pre_limiter_peak,
+            post_limiter_peak: master.post_limiter_peak,
+            max_gain_reduction_db: master.max_gain_reduction_db,
+            limited_samples: master.limited_samples,
+        },
     })
+}
+
+fn build_island(
+    mut builder: IslandBuilder,
+    sample_rate: u32,
+) -> Result<(RenderIsland, usize), String> {
+    if let Some((name, fx)) = builder.bus.take() {
+        builder.graph.set_buses(vec![BusSpec {
+            name,
+            fx,
+            members: builder.bus_members,
+        }]);
+    }
+    builder.graph.set_automations(builder.automations);
+    let mut system = builder
+        .graph
+        .compile(sample_rate as f32)
+        .map_err(|error| format!("could not build a render island: {error:?}"))?;
+    // Island outputs are summed before one final piece-wide limiter. Leaving
+    // each island's limiter active would compress branches independently and
+    // change both their balance and the historical single-master semantics.
+    system
+        .set_sink_parameter(0, "limiter_threshold", f32::MAX)
+        .map_err(|error| format!("could not configure a render island: {error}"))?;
+    let mut scheduler = EventScheduler::new();
+    let notes = schedule(&mut scheduler, &builder.placed, &builder.graph);
+    Ok((
+        RenderIsland {
+            system,
+            scheduler,
+            start_frame: builder.start_frame,
+            end_frame: builder.end_frame,
+        },
+        notes,
+    ))
+}
+
+fn render_islands(
+    islands: Vec<RenderIsland>,
+    piece_frames: u64,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<IslandAudio>, String> {
+    let total_work = islands
+        .iter()
+        .map(|island| island.end_frame - island.start_frame)
+        .sum::<u64>()
+        .max(1);
+    let island_count = islands.len();
+    let mut completed_work = 0u64;
+    let mut completed = 0usize;
+    let mut results = (0..island_count).map(|_| None).collect::<Vec<_>>();
+    let (sender, receiver) = mpsc::channel();
+    let report_every = (total_work / 100).max(1);
+
+    std::thread::scope(|thread_scope| {
+        let worker_sender = sender.clone();
+        thread_scope.spawn(move || {
+            rayon::scope(|scope| {
+                for (index, island) in islands.into_iter().enumerate() {
+                    let sender = worker_sender.clone();
+                    scope.spawn(move |_| {
+                        let result = render_island(island, report_every, &sender);
+                        let _ = sender.send(WorkerMessage::Done { index, result });
+                    });
+                }
+            });
+        });
+        drop(sender);
+        while completed < island_count {
+            let Ok(message) = receiver.recv() else {
+                break;
+            };
+            match message {
+                WorkerMessage::Advanced(frames) => {
+                    completed_work = (completed_work + frames).min(total_work);
+                    let piece_progress = ((completed_work as u128 * piece_frames as u128)
+                        / total_work as u128) as u64;
+                    progress(Progress::Rendering {
+                        frames: piece_progress.min(piece_frames),
+                        total_frames: piece_frames,
+                    });
+                }
+                WorkerMessage::Done { index, result } => {
+                    results[index] = Some(result);
+                    completed += 1;
+                }
+            }
+        }
+    });
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.ok_or_else(|| format!("render island {index} stopped without a result"))?
+        })
+        .collect()
+}
+
+fn render_island(
+    mut island: RenderIsland,
+    report_every: u64,
+    progress: &mpsc::Sender<WorkerMessage>,
+) -> Result<IslandAudio, String> {
+    let frames = island.end_frame - island.start_frame;
+    let mut samples = Vec::with_capacity(frames as usize * 2);
+    let mut frame = island.start_frame;
+    let mut reported = frame;
+    let mut next_report = frame + report_every;
+    while frame < island.end_frame {
+        frame = render_block(
+            &mut island.system,
+            &mut island.scheduler,
+            frame,
+            &mut samples,
+        );
+        if frame >= next_report {
+            let bounded = frame.min(island.end_frame);
+            let _ = progress.send(WorkerMessage::Advanced(bounded - reported));
+            reported = bounded;
+            next_report = frame + report_every;
+        }
+    }
+    if reported < island.end_frame {
+        let _ = progress.send(WorkerMessage::Advanced(island.end_frame - reported));
+    }
+    samples.truncate(frames as usize * 2);
+    Ok(IslandAudio {
+        start_frame: island.start_frame,
+        samples,
+    })
+}
+
+fn mix_and_limit(
+    islands: Vec<IslandAudio>,
+    total_frames: u64,
+    sample_rate: u32,
+) -> (Vec<f32>, SinkTelemetry) {
+    let mut mixed = vec![0.0f32; total_frames as usize * 2];
+    // `islands` is in declaration order even though workers finish in another
+    // order. Fixed-order accumulation keeps floating-point renders bit-exact.
+    for island in islands {
+        let start = island.start_frame as usize;
+        for (offset, frame) in island.samples.chunks_exact(2).enumerate() {
+            let target = (start + offset) * 2;
+            if target + 1 >= mixed.len() {
+                break;
+            }
+            mixed[target] += frame[0];
+            mixed[target + 1] += frame[1];
+        }
+    }
+
+    let mut sink = AudioOutputSink::new(sample_rate as f32);
+    let mut telemetry = SinkTelemetry::default();
+    for chunk in mixed.chunks_mut(512 * 2) {
+        let block: Block = chunk
+            .chunks_exact(2)
+            .map(|frame| [frame[0], frame[1]])
+            .collect();
+        sink.push(Arc::new(block), 0);
+        for (target, frame) in chunk.chunks_exact_mut(2).zip(sink.consume()) {
+            target.copy_from_slice(&frame);
+        }
+        if let Some(block) = sink.telemetry() {
+            telemetry.pre_limiter_peak = telemetry.pre_limiter_peak.max(block.pre_limiter_peak);
+            telemetry.post_limiter_peak = telemetry.post_limiter_peak.max(block.post_limiter_peak);
+            telemetry.max_gain_reduction_db = telemetry
+                .max_gain_reduction_db
+                .max(block.max_gain_reduction_db);
+            telemetry.limited_samples += block.limited_samples;
+        }
+    }
+    (mixed, telemetry)
 }
 
 /// How many frames one of a section's cycles lasts.
@@ -467,6 +700,25 @@ mod tests {
     }
 
     #[test]
+    fn ungrouped_occurrences_become_independent_render_islands() {
+        let piece = rendered("bpm 120\ntail 0\nsection a 1 {\n  k kick \"x\"\n}\narrange a a a\n");
+        assert_eq!(piece.occurrences, 3);
+        assert_eq!(piece.telemetry.islands, 3);
+        assert_eq!(piece.telemetry.slots, 3);
+        assert!(piece.telemetry.worker_threads >= 1);
+    }
+
+    #[test]
+    fn a_shared_bus_remains_one_piece_wide_island() {
+        let piece = rendered(
+            "bpm 120\ntail 0\nsection a 1 {\n  group drums {\n    k kick \"x\"\n  } | reverb 0.25\n}\narrange a a a\n",
+        );
+        assert_eq!(piece.occurrences, 3);
+        assert_eq!(piece.telemetry.islands, 1);
+        assert_eq!(piece.telemetry.slots, 3);
+    }
+
+    #[test]
     fn a_span_places_a_line_inside_its_section() {
         let piece = rendered("bpm 120\ntail 0\nsection a 4 {\n  fill kick \"x\" @ 4\n}\n");
         assert_eq!(piece.notes, 1);
@@ -486,6 +738,9 @@ mod tests {
         );
         let worst = piece.samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(worst <= 0.95 + 1e-6, "peaked at {worst}");
+        assert!(piece.telemetry.pre_limiter_peak >= piece.telemetry.post_limiter_peak);
+        assert!(piece.telemetry.max_gain_reduction_db > 0.0);
+        assert!(piece.telemetry.limited_samples > 0);
     }
 
     #[test]
