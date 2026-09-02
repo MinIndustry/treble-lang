@@ -5,8 +5,7 @@
 //! itself has no engine dependency and a checker should not need one.
 
 // Only the renderer deals in paths; `check` and `info` take them as strings.
-#[cfg(feature = "render")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const USAGE: &str = "\
 treble — the Treble language toolchain
