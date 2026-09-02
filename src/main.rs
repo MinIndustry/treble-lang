@@ -5,8 +5,7 @@
 //! itself has no engine dependency and a checker should not need one.
 
 // Only the renderer deals in paths; `check` and `info` take them as strings.
-#[cfg(feature = "render")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const USAGE: &str = "\
 treble — the Treble language toolchain
@@ -78,11 +77,22 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
             if result.errors.len() == 1 { "" } else { "s" }
         ));
     }
+    // `load` lines resolve beside the file being checked, so a broken path
+    // or a loaded file that sounds is found now rather than at render time.
+    let loaded = match loaded_definitions(&session, Path::new(path)) {
+        Ok(definitions) => definitions,
+        Err(problem) => {
+            eprintln!("{path}: {problem}");
+            return Err(format!("a load line would not resolve in {path}"));
+        }
+    };
     // A `def` that parses can still be rejected when it is lowered onto the
     // engine — "a tone takes either a `gain` level or its own envelope, not
     // both" is a parse-clean, render-fatal mistake. Checking it here is the
     // difference between finding it now and finding it at render time.
-    let lowering = check_definitions(&session);
+    let mut lowering = check_definitions(&session);
+    lowering.extend(check_loaded(&loaded));
+    lowering.sort();
     for problem in &lowering {
         eprintln!("{path}: {problem}");
     }
@@ -178,6 +188,53 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve the buffer's `load` lines into instrument definitions (§2.5).
+///
+/// The spec leaves resolution to the consumer. This consumer is a command
+/// line with a file argument, so a relative path resolves beside that file
+/// and nowhere else; an absolute path is used as written. A loaded file
+/// holds `def` blocks, comments and blank lines only. Registration order
+/// carries the precedence: earlier `load` lines first, buffer definitions
+/// last, each later registration overwriting the name before it.
+#[cfg(feature = "render")]
+fn loaded_definitions(
+    session: &treble_lang::Session,
+    piece_path: &Path,
+) -> Result<Vec<treble_lang::ast::InstrumentDef>, String> {
+    let base = piece_path.parent().unwrap_or(Path::new("."));
+    let mut definitions = Vec::new();
+    for load in session.loads() {
+        let path = Path::new(load);
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base.join(path)
+        };
+        let source = std::fs::read_to_string(&resolved)
+            .map_err(|error| format!("load \"{load}\": {error}"))?;
+        let (program, errors) = treble_lang::parser::parse_program(&source);
+        if let Some(error) = errors.first() {
+            return Err(format!(
+                "load \"{load}\": line {}: {}",
+                error.location.line, error.message
+            ));
+        }
+        for line in program.lines {
+            match line {
+                treble_lang::SourceLine::Def(definition) => definitions.push(*definition),
+                treble_lang::SourceLine::Comment(_) | treble_lang::SourceLine::Blank => {}
+                _ => {
+                    return Err(format!(
+                        "load \"{load}\": a loaded file holds `def` blocks only — \
+                         a line that sounds or configures belongs in the buffer"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(definitions)
+}
+
 /// Problems a `def` block would hit when lowered onto the engine.
 ///
 /// Only possible with the renderer available; without it the checker says what
@@ -202,9 +259,34 @@ fn check_definitions(session: &treble_lang::Session) -> Vec<String> {
     problems
 }
 
+#[cfg(feature = "render")]
+fn check_loaded(definitions: &[treble_lang::ast::InstrumentDef]) -> Vec<String> {
+    definitions
+        .iter()
+        .filter_map(|definition| {
+            treble_lang::render::compile::lower_instrument_def(definition, 2.0)
+                .err()
+                .map(|error| format!("def {}: {error}", definition.name))
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "render"))]
+fn check_loaded(_definitions: &[treble_lang::ast::InstrumentDef]) -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(not(feature = "render"))]
 fn check_definitions(_session: &treble_lang::Session) -> Vec<String> {
     Vec::new()
+}
+
+#[cfg(not(feature = "render"))]
+fn loaded_definitions(
+    _session: &treble_lang::Session,
+    _piece_path: &Path,
+) -> Result<Vec<treble_lang::ast::InstrumentDef>, String> {
+    Ok(Vec::new())
 }
 
 fn clock(seconds: f64) -> String {
@@ -301,6 +383,13 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         .sections
         .first()
         .map_or(2.0, |section| section.cycle_seconds());
+    for definition in &loaded_definitions(&session, Path::new(&input))? {
+        let spec = treble_lang::render::compile::lower_instrument_def(definition, cycle)
+            .map_err(|error| format!("def {}: {error}", definition.name))?;
+        registry
+            .register(spec)
+            .map_err(|error| format!("def {}: {error}", definition.name))?;
+    }
     for definition in session.definitions().values() {
         let spec = treble_lang::render::compile::lower_instrument_def(definition, cycle)
             .map_err(|error| format!("def {}: {error}", definition.name))?;
@@ -416,4 +505,40 @@ fn bar(fraction: f64) -> String {
         "·".repeat(WIDTH - filled),
         fraction.clamp(0.0, 1.0) * 100.0
     )
+}
+
+#[cfg(all(test, feature = "render"))]
+mod load_resolution_tests {
+    use super::*;
+
+    /// `load` resolves beside the piece file, accepts a defs-only file, and
+    /// refuses one that sounds — the CLI half of §2.5.
+    #[test]
+    fn load_lines_resolve_beside_the_piece_file() {
+        let dir = std::env::temp_dir().join(format!("treble-load-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("sounds.trbl"),
+            "-- a comment\ndef lamp {\n    tone sine gain 0.5 identity\n    env adsr 0.01 0.1 0.5 0.1\n}\n",
+        )
+        .expect("write defs");
+        let piece = dir.join("piece.rt");
+        std::fs::write(
+            &piece,
+            "bpm 120\nload \"sounds.trbl\"\nsection s 1 {\n  l lamp \"0\"\n}\n",
+        )
+        .expect("write piece");
+
+        let mut session = treble_lang::Session::new();
+        session.evaluate(&std::fs::read_to_string(&piece).unwrap());
+        let definitions = loaded_definitions(&session, &piece).expect("resolve");
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, "lamp");
+
+        std::fs::write(dir.join("sounds.trbl"), "bpm 99\n").expect("rewrite");
+        let error = loaded_definitions(&session, &piece).expect_err("a directive must be refused");
+        assert!(error.contains("def` blocks only"), "{error}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

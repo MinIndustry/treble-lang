@@ -1702,8 +1702,8 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "treble"
-version = "0.4.2"
-source = "git+https://github.com/MinIndustry/treble-core.git?tag=0.4.2#6ab3a6b74d11992c815da9c1b47cbbd8642a4131"
+version = "0.4.3"
+source = "git+https://github.com/MinIndustry/treble-core.git?tag=0.4.3#c5f7f5aad9db8401537d21f1b799c9d8308e04cb"
 dependencies = [
  "atomic_float",
  "chrono",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "treble-lang"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "criterion",
  "hound",

@@ -52,6 +52,11 @@ treble render piece.rt      # → piece.wav
 and `-m/--meta key=value` (repeatable, overrides the file's own tags — handy for
 stamping a build date or take number without editing the piece).
 
+`load "<file.trbl>"` lines resolve **beside the piece file** (an absolute path
+is used as written; nothing else is searched), so an album of pieces can share
+one instrument library. `check` validates the loads too — a broken path or a
+loaded file that sounds is reported before any render.
+
 Progress is reported on stderr and the summary on stdout, so `--json` composes:
 
 ```
