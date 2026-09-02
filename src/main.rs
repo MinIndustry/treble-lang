@@ -524,8 +524,11 @@ mod load_resolution_tests {
         )
         .expect("write defs");
         let piece = dir.join("piece.rt");
-        std::fs::write(&piece, "bpm 120\nload \"sounds.trbl\"\nsection s 1 {\n  l lamp \"0\"\n}\n")
-            .expect("write piece");
+        std::fs::write(
+            &piece,
+            "bpm 120\nload \"sounds.trbl\"\nsection s 1 {\n  l lamp \"0\"\n}\n",
+        )
+        .expect("write piece");
 
         let mut session = treble_lang::Session::new();
         session.evaluate(&std::fs::read_to_string(&piece).unwrap());
