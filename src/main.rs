@@ -302,6 +302,7 @@ fn cmd_render(_args: &[String]) -> Result<(), String> {
 #[cfg(feature = "render")]
 fn cmd_render(args: &[String]) -> Result<(), String> {
     use std::io::Write;
+    use std::path::PathBuf;
     use treble_lang::render::{Progress, render_with_progress, wav};
 
     let mut input: Option<String> = None;

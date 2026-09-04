@@ -42,7 +42,7 @@ use treble::instruments::prelude::InstrumentRegistry;
 
 use super::compile::{
     CompiledPattern, LineTravel, NOTE_GATE, PatternGate, RampWindow, Travel, compile_pattern,
-    core_curve, cycle_seconds, cycle_strikes, fx_ramp_window, pattern_fx, transform_travels,
+    core_curve, cycle_seconds, cycle_strikes_at, fx_ramp_window, pattern_fx, transform_travels,
 };
 
 /// A rendered piece: interleaved stereo samples plus what they came from.
@@ -615,12 +615,16 @@ fn schedule(scheduler: &mut EventScheduler, placed: &[Placed], graph: &AudioGrap
             continue;
         };
         for cycle in line.from_cycle..=line.to_cycle.min(line.section_cycles) {
-            // `cycle_strikes` counts cycles from the piece's start, since that
-            // is what the line's travels and its per-cycle choices are indexed
-            // by; the span is 1-based within the section, so it converts here.
+            // Travels and generative choices count from the piece's start, so a
+            // sweep keeps moving and a seeded phrase keeps evolving; the span is
+            // 1-based within the section, so it converts here. Alternations use
+            // the cycle within the section instead: `<a b c>` is per-bar
+            // harmony, so alternative *k* belongs to bar *k* and must not rotate
+            // because the arrangement moved the section (§8.5).
             let absolute = line.pattern.ramp_origin + u64::from(cycle - 1);
+            let within_section = u64::from(cycle - 1);
             let cycle_start = line.start_frame + u64::from(cycle - 1) * line.cycle_frames;
-            for strike in cycle_strikes(&line.pattern, absolute) {
+            for strike in cycle_strikes_at(&line.pattern, absolute, within_section) {
                 let start = cycle_start + (strike.start * line.cycle_frames as f64).round() as u64;
                 let end = start
                     + ((strike.end - strike.start) * NOTE_GATE * line.cycle_frames as f64).round()
@@ -677,6 +681,54 @@ mod tests {
         assert!(
             peak(&piece, 0, 44_100) > 0.001,
             "the first second is silent"
+        );
+    }
+
+    /// The pitches a source schedules, in order, for one named line.
+    fn midi_of(source: &str, line: &str) -> Vec<u8> {
+        let (program, errors) = crate::parser::parse_program(source);
+        assert!(errors.is_empty(), "parse: {errors:?}");
+        let (piece, errors) = crate::piece::resolve(&program, (120, (4, 4), None));
+        assert!(errors.is_empty(), "resolve: {errors:?}");
+        let mut notes = scheduled_notes(&piece, &InstrumentRegistry::built_in(), 44_100)
+            .expect("scheduled notes");
+        notes.sort_by_key(|note| note.start);
+        notes
+            .iter()
+            .filter(|note| note.line == line)
+            .map(|note| note.midi)
+            .collect()
+    }
+
+    /// `<a b c>` is per-bar harmony: alternative *k* belongs to bar *k* of the
+    /// section, so a section sounds the same wherever the arrangement puts it
+    /// (§8.5) and a line's span does not rotate the cycle under it.
+    #[test]
+    fn alternation_counts_from_the_section_not_the_piece() {
+        // Two identical sections at different points in one arrangement.
+        let source = "bpm 120\ntail 0\n\
+             section pad 4 {\n  rest sine \"~\"\n}\n\
+             section one 3 {\n  a sine \"<c3 e4 c5>\"\n}\n\
+             section gap 1 {\n  quiet sine \"~\"\n}\n\
+             section two 3 {\n  b sine \"<c3 e4 c5>\"\n}\n\
+             arrange pad one gap two\n";
+        let written = vec![48, 64, 72];
+        assert_eq!(midi_of(source, "a"), written, "the first playing");
+        assert_eq!(
+            midi_of(source, "b"),
+            written,
+            "an identical section must not rotate because it starts elsewhere"
+        );
+
+        // A span that opens later still reads the alternation by bar number, so
+        // it stays under whatever the full-span lines are playing.
+        let spanned = "bpm 120\ntail 0\n\
+             section s 4 {\n  chords sine \"<c3 e4 c5 g4>\"\n  late sine \"<c3 e4 c5 g4>\" @ 3..\n}\n";
+        assert_eq!(midi_of(spanned, "chords"), vec![48, 64, 72, 67]);
+        assert_eq!(
+            midi_of(spanned, "late"),
+            vec![72, 67],
+            "a line entering at bar 3 takes the third alternative, not the first"
         );
     }
 
@@ -893,8 +945,9 @@ pub fn scheduled_notes(
             let to = line.span.map_or(section.cycles, |s| s.end(section.cycles));
             for cycle in from..=to.min(section.cycles) {
                 let absolute = origin_cycle + u64::from(cycle - 1);
+                let within_section = u64::from(cycle - 1);
                 let cycle_start = at_frame + u64::from(cycle - 1) * cycle_frames;
-                for strike in cycle_strikes(&compiled, absolute) {
+                for strike in cycle_strikes_at(&compiled, absolute, within_section) {
                     let start = cycle_start + (strike.start * cycle_frames as f64).round() as u64;
                     let end = start
                         + ((strike.end - strike.start) * NOTE_GATE * cycle_frames as f64).round()
