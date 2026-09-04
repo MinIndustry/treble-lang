@@ -1228,6 +1228,15 @@ real time, but not in cycles: `section bridge 8` is eight cycles of whatever
 `ramp` (§4.6) and `every` (§4.3) count from the **start of the line's span in
 the current occurrence of the section**, not from the start of the piece.
 
+Alternation (§3.11) counts from the **section's first cycle** instead, whatever
+the line's span: alternative *k* sounds on bar *k*. An alternation is how per-bar
+harmony is written, so a chord line spanning the whole section and a melody
+entering at bar 5 have to agree about which bar carries which chord — indexing
+either of them from its own span would set them adrift. It follows that a line
+entering late takes the alternative belonging to the bar it enters on; a phrase
+that should begin at its own first alternative is written across the whole
+section with its leading bars as rests.
+
 A section is self-contained for the same reason its directives are: `arrange
 verse*4` plays four identical verses, and a filter opening over the verse opens
 once per verse. The consequence is that a build cannot straddle the seam

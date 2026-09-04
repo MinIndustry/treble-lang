@@ -326,6 +326,24 @@ pub struct Strike {
 /// Split out of [`schedule_cycle`] so the velocity rules can be read off
 /// directly rather than inferred from what the audio backend received.
 pub fn cycle_strikes(pattern: &CompiledPattern, cycle: u64) -> Vec<Strike> {
+    cycle_strikes_at(pattern, cycle, cycle)
+}
+
+/// [`cycle_strikes`], with the alternation clock stated separately.
+///
+/// Everything indexed by `cycle` — travels, `?p` drops, `[a|b]` choices, a
+/// `solo`'s walk — counts from wherever the caller's clock starts, so a sweep
+/// keeps travelling and a seeded phrase keeps evolving. `<a b c>` is the
+/// exception: it is written as per-bar harmony, so alternative *k* belongs to
+/// bar *k* of the section it sits in and must not move when the arrangement
+/// puts that section somewhere else (§8.5). A piece passes the cycle within the
+/// section for `alternation_cycle`; a live buffer, which has no sections, passes
+/// the same value for both and is unaffected.
+pub fn cycle_strikes_at(
+    pattern: &CompiledPattern,
+    cycle: u64,
+    alternation_cycle: u64,
+) -> Vec<Strike> {
     let (segments, cycle_factor, line_velocity) = pattern_cycle(pattern, cycle);
     // A group's shared `| vel` is a bus level rather than a strike, so it is
     // the one velocity that multiplies — including over a step's own `:v`.
@@ -356,7 +374,13 @@ pub fn cycle_strikes(pattern: &CompiledPattern, cycle: u64) -> Vec<Strike> {
         // The step index keeps sibling steps independent; the buffer's seed is
         // what makes the whole passage rerollable.
         let seed = mix_seed(pattern.seed, segment.source_step);
-        for resolved in resolve_events(&segment.event, cycle, &pattern.name, seed) {
+        for resolved in resolve_events_at(
+            &segment.event,
+            cycle,
+            alternation_cycle,
+            &pattern.name,
+            seed,
+        ) {
             let start = outer_start + resolved.start * outer_duration;
             // `:v` and `X` are absolute: they replace the line's `| vel` for the
             // step rather than scaling it, so a performer nudging `vel` to
@@ -2227,6 +2251,18 @@ pub fn resolve_events(
     pattern_name: &str,
     seed: u64,
 ) -> Vec<ResolvedEvent> {
+    resolve_events_at(event, cycle, cycle, pattern_name, seed)
+}
+
+/// [`resolve_events`], with the alternation clock stated separately — see
+/// [`cycle_strikes_at`] for why the two differ inside a piece.
+pub fn resolve_events_at(
+    event: &Event,
+    cycle: u64,
+    alternation_cycle: u64,
+    pattern_name: &str,
+    seed: u64,
+) -> Vec<ResolvedEvent> {
     match event {
         Event::Trigger => vec![ResolvedEvent {
             start: 0.0,
@@ -2241,12 +2277,12 @@ pub fn resolve_events(
             velocity: None,
         }],
         Event::Alternatives(options) if !options.is_empty() => {
-            let option = &options[cycle as usize % options.len()];
-            resolve_option(option, cycle, pattern_name, seed)
+            let option = &options[alternation_cycle as usize % options.len()];
+            resolve_option_at(option, cycle, alternation_cycle, pattern_name, seed)
         }
         Event::Choice(options) if !options.is_empty() => {
             let option = &options[choice_index(cycle, pattern_name, seed, options.len())];
-            resolve_option(option, cycle, pattern_name, seed)
+            resolve_option_at(option, cycle, alternation_cycle, pattern_name, seed)
         }
         Event::Solo { notes, steps } if !notes.is_empty() => {
             solo_events(notes, *steps, cycle, pattern_name, seed)
@@ -2326,6 +2362,17 @@ pub fn resolve_option(
     pattern_name: &str,
     seed: u64,
 ) -> Vec<ResolvedEvent> {
+    resolve_option_at(option, cycle, cycle, pattern_name, seed)
+}
+
+/// [`resolve_option`], carrying the alternation clock down to nested `<a b c>`.
+pub fn resolve_option_at(
+    option: &[TimedEvent],
+    cycle: u64,
+    alternation_cycle: u64,
+    pattern_name: &str,
+    seed: u64,
+) -> Vec<ResolvedEvent> {
     let mut resolved = Vec::new();
     for (index, timed) in option.iter().enumerate() {
         if timed
@@ -2335,7 +2382,13 @@ pub fn resolve_option(
             continue;
         }
         let duration = timed.end - timed.start;
-        for nested in resolve_events(&timed.event, cycle, pattern_name, mix_seed(seed, index)) {
+        for nested in resolve_events_at(
+            &timed.event,
+            cycle,
+            alternation_cycle,
+            pattern_name,
+            mix_seed(seed, index),
+        ) {
             resolved.push(ResolvedEvent {
                 start: timed.start + nested.start * duration,
                 end: timed.start + nested.end * duration,
