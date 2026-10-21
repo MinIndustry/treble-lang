@@ -13,6 +13,11 @@ pub mod piece;
 /// and a consumer that only parses should not pay for one.
 #[cfg(feature = "render")]
 pub mod render;
+/// A language server and player for editors, over stdio (`treble-lang serve`).
+///
+/// Behind the `serve` feature, which brings the renderer and a sound card.
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod session;
 
 pub use ast::{MiniNotation, PatternDef, Program, SourceLine, Span};

@@ -14,11 +14,13 @@ USAGE:
     treble check <file.rt>
     treble info  <file.rt>
     treble render <file.rt> [-o <out.wav>] [options]
+    treble serve
 
 COMMANDS:
     check     Parse a buffer and report errors. Exit 1 if any.
     info      Print a piece's structure — sections, arrangement, metadata.
     render    Render a piece to a WAV file.
+    serve     Speak LSP on stdin/stdout, with a player, for an editor.
 
 RENDER OPTIONS:
     -o, --out <path>     Output file. Defaults to the input with a .wav suffix.
@@ -47,6 +49,7 @@ fn main() {
         "check" => cmd_check(rest),
         "info" => cmd_info(rest),
         "render" => cmd_render(rest),
+        "serve" => cmd_serve(),
         // A bare path keeps the older `treble-lang <file>` spelling working.
         other if !other.starts_with('-') => cmd_check(&args),
         other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
@@ -292,6 +295,16 @@ fn loaded_definitions(
 fn clock(seconds: f64) -> String {
     let whole = seconds.max(0.0) as u64;
     format!("{}:{:02}", whole / 60, whole % 60)
+}
+
+#[cfg(feature = "serve")]
+fn cmd_serve() -> Result<(), String> {
+    treble_lang::serve::run()
+}
+
+#[cfg(not(feature = "serve"))]
+fn cmd_serve() -> Result<(), String> {
+    Err("this build has no server — rebuild with `--features serve`".into())
 }
 
 #[cfg(not(feature = "render"))]
