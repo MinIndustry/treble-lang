@@ -865,6 +865,7 @@ pub fn resolve_sequence(sequence: &Sequence, travel: LineTravel) -> Sequence {
                     .map(|modifier| resolve_modifier(modifier, travel))
                     .collect(),
                 velocity: step.velocity.as_ref().map(|ramp| travel_f64(ramp, travel)),
+                source: step.source,
             })
             .collect(),
     }

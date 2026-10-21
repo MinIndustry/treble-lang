@@ -25,7 +25,12 @@ pub fn parse_mini(input: &str) -> Result<MiniNotation, String> {
         });
     }
     match parse_sequence(trimmed) {
-        Ok(("", seq)) => {
+        Ok(("", mut seq)) => {
+            // Steps record where they sit as the input left after them, which
+            // is all a nom parser over `&str` knows; turn that into offsets from
+            // the start of the notation as written, leading spaces included.
+            let leading = input.len() - input.trim_start().len();
+            rebase_sources(&mut seq, (leading + trimmed.len()) as u32);
             let notation = MiniNotation { sequence: seq };
             validate_sequence(&notation.sequence)?;
             Ok(notation)
@@ -42,6 +47,27 @@ pub fn parse_mini(input: &str) -> Result<MiniNotation, String> {
             _ => "a group uses ',' for a chord or '|' for a random choice, not both".to_string(),
         }),
         Err(e) => Err(format!("mini-notation parse error: {}", e)),
+    }
+}
+
+/// Turn every step's [`Source`], recorded by [`parse_step`] as bytes remaining
+/// after its start and end, into offsets from the start of a notation whose
+/// parsed text ends `end` bytes in.
+fn rebase_sources(sequence: &mut Sequence, end: u32) {
+    for step in &mut sequence.steps {
+        step.source = Source {
+            start: end - step.source.start,
+            end: end - step.source.end,
+        };
+        match &mut step.atom {
+            Atom::Group(group) => {
+                for layer in &mut group.layers {
+                    rebase_sources(layer, end);
+                }
+            }
+            Atom::Alternation(alternation) => rebase_sources(&mut alternation.sequence, end),
+            _ => {}
+        }
     }
 }
 
@@ -183,6 +209,7 @@ fn parse_sequence(input: &str) -> IResult<&str, Sequence> {
 // --- Step = Atom { Modifier } ---
 
 fn parse_step(input: &str) -> IResult<&str, Step> {
+    let remaining_at_start = input.len() as u32;
     // `X` is stored as `x:1.0` rather than as an atom of its own, so a consumer
     // only has to implement velocity once.
     let (mut input, accented) = match parse_accent(input) {
@@ -229,6 +256,11 @@ fn parse_step(input: &str) -> IResult<&str, Step> {
             atom,
             modifiers,
             velocity,
+            // Bytes remaining, not offsets: see `rebase_sources`.
+            source: Source {
+                start: remaining_at_start,
+                end: input.len() as u32,
+            },
         },
     ))
 }
@@ -593,6 +625,37 @@ mod tests {
     use super::*;
     use crate::ast::program::RampCurve;
     use pretty_assertions::assert_eq;
+
+    // --- Sources ---
+
+    /// What each step's recorded range covers in the text it came from.
+    fn written<'a>(text: &'a str, step: &Step) -> &'a str {
+        &text[step.source.start as usize..step.source.end as usize]
+    }
+
+    #[test]
+    fn steps_record_where_they_were_written() {
+        let text = "  c4 [e4 g4:0.5]*2 <x X> 0:0.6(3,8)  ";
+        let m = parse_mini(text).unwrap();
+        let steps = &m.sequence.steps;
+        assert_eq!(written(text, &steps[0]), "c4");
+        assert_eq!(written(text, &steps[1]), "[e4 g4:0.5]*2");
+        assert_eq!(written(text, &steps[2]), "<x X>");
+        assert_eq!(written(text, &steps[3]), "0:0.6(3,8)");
+        let Atom::Group(group) = &steps[1].atom else {
+            panic!("expected a group")
+        };
+        assert_eq!(written(text, &group.layers[0].steps[1]), "g4:0.5");
+        let Atom::Alternation(alternation) = &steps[2].atom else {
+            panic!("expected an alternation")
+        };
+        assert_eq!(written(text, &alternation.sequence.steps[1]), "X");
+    }
+
+    #[test]
+    fn sources_do_not_change_what_a_step_means() {
+        assert_eq!(parse_mini("c4  e4").unwrap(), parse_mini("c4 e4").unwrap());
+    }
 
     // --- Helper to build notes quickly ---
     fn n(letter: NoteLetter, acc: Accidental, oct: u8) -> Atom {
