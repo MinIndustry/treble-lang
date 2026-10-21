@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "treble-lang"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "cpal",
  "criterion",
