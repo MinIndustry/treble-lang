@@ -19,6 +19,14 @@ pub fn parse_line(line: &str) -> Result<SourceLine, String> {
         return Ok(SourceLine::Comment(trimmed.to_string()));
     }
 
+    // A chain continued on its own line joins the statement above it before
+    // this parser sees it (§4.8); one that reaches here had nothing to join.
+    if trimmed.starts_with('|') {
+        return Err("a line starting with `|` continues the pattern above it, \
+                    but the line above isn't a pattern or a group's closing `}`"
+            .to_string());
+    }
+
     // Directives
     if let Some(rest) = strip_keyword(trimmed, "bpm") {
         return parse_bpm(rest);

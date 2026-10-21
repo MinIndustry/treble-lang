@@ -1,4 +1,4 @@
-# Treble — Language Specification v0.2
+# Treble — Language Specification v0.3
 
 ## Overview
 
@@ -40,11 +40,22 @@ their members stay ordinary lines so that line-based editing — muting a line,
 nudging it, reporting an error against it — keeps working inside a block. A
 `group` nests one level inside a `section`; nothing else nests.
 
+One line kind may span several lines: a pattern line can break inside its
+quotes and continue its transform chain on lines that start with `|` (§4.8).
+It is still one line in every other sense — one statement, muted as a whole,
+reported against the line it starts on.
+
 ### 1.1 Comments
 
 ```
 -- This is a comment. Everything after -- until end-of-line is ignored.
+k kick "x ~ x ~"   -- so is this
 ```
+
+`--` starts a comment anywhere on a line, inside a pattern's quotes too —
+which is what lets a broken pattern annotate its bars (§4.8). No notation
+contains `--`, so nothing is lost. Inside a `def` block a comment still needs
+a line of its own.
 
 ### 1.2 Blank Lines
 
@@ -769,6 +780,38 @@ parsed and retained but does not produce audio. This allows quick toggling.
 ; bass sine "c2 ~ eb2 ~"     -- muted
 bass sine "c2 ~ eb2 ~"       -- active
 ```
+
+### 4.8 Breaking a Line
+
+A pattern line that grows long may be written over several lines. Two places
+may break:
+
+- **Inside the quotes**, anywhere whitespace may go. Every line up to the
+  closing quote belongs to the notation; a break reads as a space, and each
+  line may end with a comment.
+- **Before a `|`** of the transform chain: a line that starts with `|`
+  continues the pattern above it, past blank lines and comments in between.
+  The same holds for a group's `} | …` chain.
+
+```
+pad pad_dark "<
+  [0,2,4]   -- Em
+  [5,7,9]   -- C
+  [3,5,7]   -- Am
+  [0,2,4]
+>" @ 3..
+  | oct -1
+  | lpf 600..1800 | ramp 4
+```
+
+is exactly `pad pad_dark "<[0,2,4] [5,7,9] [3,5,7] [0,2,4]>" @ 3.. | oct -1 |
+lpf 600..1800 | ramp 4`. Indentation stays insignificant. The name, the
+instrument and the opening quote share the first line; the span sits after
+the closing quote. A `;` on the first line mutes the whole pattern, and an
+error anywhere in it is reported against its first line.
+
+A line that begins with `|` and follows anything other than a pattern or a
+group's closing brace is an error rather than a continuation.
 
 ---
 

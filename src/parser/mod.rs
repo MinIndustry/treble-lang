@@ -8,10 +8,12 @@
 mod instrument;
 mod lines;
 mod mini;
+mod statements;
 
 pub use instrument::parse_instrument_def;
 pub use lines::parse_line;
 pub use mini::parse_mini;
+pub use statements::{Statement, statements};
 
 use instrument::count_braces;
 
@@ -49,7 +51,12 @@ pub fn parse_program(source: &str) -> (Program, Vec<CompileError>) {
         });
     };
 
-    for (line_idx, raw) in source.lines().enumerate() {
+    // Statements, not physical lines: a pattern broken over several lines is
+    // read as one, and reported against the line it starts on (§4.8).
+    let statements = statements(source);
+    for statement in &statements {
+        let line_idx = statement.first_line;
+        let raw = statement.text.as_str();
         if let Some((_, collected)) = &mut block {
             depth += count_braces(raw, '{');
             depth -= count_braces(raw, '}').min(depth);
