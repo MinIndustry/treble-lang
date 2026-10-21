@@ -86,6 +86,9 @@ struct Placed {
     slot: usize,
     /// The absolute frame the occurrence starts at.
     start_frame: u64,
+    /// The absolute cycle the occurrence starts on. Drops, choices and solos
+    /// count from here; the line's travels count from its own first bar.
+    origin_cycle: u64,
     /// How long one of this section's cycles is, in frames.
     cycle_frames: u64,
     /// Which cycles of the section the line sounds on, 1-based and inclusive.
@@ -519,10 +522,11 @@ fn mount_line(
     automations: &mut Vec<AutomationSpec>,
     seed: u64,
 ) -> Result<Placed, String> {
+    let line_origin = travel_origin(line, origin_cycle);
     let travel = LineTravel {
         line: Travel::START,
-        cycle: origin_cycle as f64,
-        origin: origin_cycle,
+        cycle: line_origin as f64,
+        origin: line_origin,
         divisions: section.sig.0,
     };
     let (audio_fx, fx_ramps) = pattern_fx(&line.transforms, section.cycle_seconds(), travel)
@@ -553,7 +557,7 @@ fn mount_line(
             name: line.name.clone(),
             ..PatternGate::default()
         },
-        origin_cycle,
+        line_origin,
         section.sig.0,
         seed,
     );
@@ -588,6 +592,7 @@ fn mount_line(
         pattern: compiled,
         slot,
         start_frame,
+        origin_cycle,
         cycle_frames,
         from_cycle: span.map_or(1, |span| span.start()),
         to_cycle: span.map_or(section.cycles, |span| span.end(section.cycles)),
@@ -616,13 +621,15 @@ fn schedule(scheduler: &mut EventScheduler, placed: &[Placed], graph: &AudioGrap
             continue;
         };
         for cycle in line.from_cycle..=line.to_cycle.min(line.section_cycles) {
-            // Travels and generative choices count from the piece's start, so a
-            // sweep keeps moving and a seeded phrase keeps evolving; the span is
-            // 1-based within the section, so it converts here. Alternations use
-            // the cycle within the section instead: `<a b c>` is per-bar
-            // harmony, so alternative *k* belongs to bar *k* and must not rotate
-            // because the arrangement moved the section (§8.5).
-            let absolute = line.pattern.ramp_origin + u64::from(cycle - 1);
+            // Generative choices count from the occurrence's place in the
+            // piece, so a seeded phrase keeps evolving; travels are measured
+            // against the line's own window, which starts at its first bar
+            // (`travel_origin`). The span is 1-based within the section, so it
+            // converts here. Alternations use the cycle within the section
+            // instead: `<a b c>` is per-bar harmony, so alternative *k* belongs
+            // to bar *k* and must not rotate because the arrangement moved the
+            // section (§8.5).
+            let absolute = line.origin_cycle + u64::from(cycle - 1);
             let within_section = u64::from(cycle - 1);
             let cycle_start = line.start_frame + u64::from(cycle - 1) * line.cycle_frames;
             for strike in cycle_strikes_at(&line.pattern, absolute, within_section) {
@@ -709,6 +716,33 @@ mod tests {
             .collect();
         // `@ 2` keeps it to the second bar, where the alternation is on `[e3 g3]`.
         assert_eq!(written, vec![(1, "e3"), (1, "g3")]);
+    }
+
+    /// `ramp` counts from where the line comes in (§8.6): a line entering on
+    /// bar 3 of a section starts its travel there, not two bars in.
+    #[test]
+    fn a_late_line_ramps_from_its_own_first_bar() {
+        let source =
+            "bpm 120\ntail 0\nsection a 4 {\n  late sine \"c4\" @ 3.. | vel 0.2..1.0 | ramp 2\n}\n";
+        let (program, errors) = crate::parser::parse_program(source);
+        assert!(errors.is_empty(), "parse: {errors:?}");
+        let (piece, errors) = crate::piece::resolve(&program, (120, (4, 4), None));
+        assert!(errors.is_empty(), "resolve: {errors:?}");
+        let lanes =
+            section_strikes(&piece, &InstrumentRegistry::built_in(), 0, None).expect("strikes");
+        let velocities: Vec<(u32, f32)> = lanes[0]
+            .strikes
+            .iter()
+            .map(|(cycle, strike)| (*cycle, (strike.velocity * 100.0).round() / 100.0))
+            .collect();
+        assert_eq!(velocities, vec![(2, 0.2), (3, 0.6)]);
+        let vel = &lanes[0].automations[0];
+        assert_eq!(
+            vel.points
+                .first()
+                .map(|p| (p.0, (p.1 * 100.0).round() / 100.0)),
+            Some((2.0, 0.2))
+        );
     }
 
     /// The pitches a source schedules, in order, for one named line.
@@ -1164,10 +1198,11 @@ fn compile_line(
     registry: &InstrumentRegistry,
     origin_cycle: u64,
 ) -> Result<CompiledPattern, String> {
+    let line_origin = travel_origin(line, origin_cycle);
     let travel = LineTravel {
         line: Travel::START,
-        cycle: origin_cycle as f64,
-        origin: origin_cycle,
+        cycle: line_origin as f64,
+        origin: line_origin,
         divisions: section.sig.0,
     };
     let (audio_fx, fx_ramps) = pattern_fx(&line.transforms, section.cycle_seconds(), travel)
@@ -1185,10 +1220,17 @@ fn compile_line(
         instrument_fx,
         spec,
         PatternGate::default(),
-        origin_cycle,
+        line_origin,
         section.sig.0,
         piece.seed,
     ))
+}
+
+/// The absolute cycle a line's travels start from: the first bar of its span
+/// in this occurrence (§8.6), so a line entering on bar 13 with `| ramp 4`
+/// sweeps across bars 13 to 16 rather than arriving already swept.
+fn travel_origin(line: &PatternDef, occurrence_start: u64) -> u64 {
+    occurrence_start + u64::from(line.span.map_or(1, |span| span.start()) - 1)
 }
 
 /// Every strike of a compiled line across the cycles its span allows, with the
