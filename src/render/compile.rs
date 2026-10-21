@@ -25,7 +25,7 @@ use crate::ast::{
     Accidental, Alternation, ArpMode, Atom, EnvelopeDef, FxArg, FxCall, FxValue, Group, GroupMode,
     InstrumentDef, LfoRate, LfoWave, Lifecycle, MiniNotation, MixMode, Modifier, MonoAllocation,
     NoteLetter, PanSweep, PatternDef, PitchRoot, PolyAllocation, Ramp, RampCurve, Relation,
-    ScaleMode, SegmentDef, Sequence, Solo, Step, ToneDef, Transform, VoiceDef, Waveform,
+    ScaleMode, SegmentDef, Sequence, Solo, Source, Step, ToneDef, Transform, VoiceDef, Waveform,
 };
 
 /// Mixer mute/solo for one pattern, carried through compilation.
@@ -74,6 +74,8 @@ pub struct TimedEvent {
     pub drop: Option<f64>,
     /// An inner step's own `:v` / `X`, which beats the enclosing step's.
     pub velocity: Option<f32>,
+    /// The step that wrote this event.
+    pub source: Source,
 }
 
 #[derive(Debug, PartialEq)]
@@ -83,6 +85,11 @@ pub struct ResolvedEvent {
     pub notes: Vec<u8>,
     /// The innermost written velocity for this event, if any.
     pub velocity: Option<f32>,
+    /// The innermost step that wrote this event. `None` from a bare trigger or
+    /// note, which takes the enclosing step's.
+    pub source: Option<Source>,
+    /// An `x`/`X` trigger, whose note is a placeholder rather than a pitch.
+    pub trigger: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +103,8 @@ pub struct Segment {
     /// The step's own velocity (`:v`, or `X`'s implied 1.0). Absolute: it
     /// replaces the line's `| vel` for this step rather than scaling it.
     pub velocity: Option<f32>,
+    /// The step that wrote this segment.
+    pub source: Source,
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +328,11 @@ pub struct Strike {
     pub end: f64,
     pub notes: Vec<u8>,
     pub velocity: f32,
+    /// The innermost step in the notation that wrote this strike.
+    pub source: Source,
+    /// An `x`/`X` trigger: `notes` holds the engine's placeholder pitch, not
+    /// one the line asked for.
+    pub trigger: bool,
 }
 
 /// Everything one pattern sounds in one cycle, before frames get involved.
@@ -396,6 +410,8 @@ pub fn cycle_strikes_at(
                 end: start + (resolved.end - resolved.start) * outer_duration,
                 notes: resolved.notes,
                 velocity,
+                source: resolved.source.unwrap_or(segment.source),
+                trigger: resolved.trigger,
             });
         }
     }
@@ -1718,6 +1734,8 @@ pub struct Slot {
     /// The written velocity for this slot — the innermost `:v` or `X` that
     /// covers it. `None` takes the line's `| vel`.
     pub velocity: Option<f32>,
+    /// The step that wrote this slot.
+    pub source: Source,
 }
 
 pub fn expand_sequence(
@@ -1773,6 +1791,7 @@ pub fn expand_step(
                 drop: None,
                 source_step,
                 velocity: None,
+                source: step.source,
             }),
         }
         return;
@@ -1867,6 +1886,7 @@ pub fn base_slots(
         drop: None,
         source_step,
         velocity: None,
+        source: step.source,
     });
     slots
 }
@@ -1897,6 +1917,7 @@ pub fn euclidean_slots(slots: Vec<Slot>, beats: u32, steps: u32, offset: u32) ->
     }
     let positions = onsets.len() as f64;
     let source_step = slots.first().map(|slot| slot.source_step).unwrap_or(0);
+    let source = slots.first().map(|slot| slot.source).unwrap_or_default();
     let position_weight = slots.iter().map(|slot| slot.weight).sum::<f64>() / positions;
     let mut expanded = Vec::with_capacity(onsets.len() * slots.len());
     for count in onsets {
@@ -1907,6 +1928,7 @@ pub fn euclidean_slots(slots: Vec<Slot>, beats: u32, steps: u32, offset: u32) ->
                 drop: None,
                 source_step,
                 velocity: None,
+                source,
             });
             continue;
         }
@@ -1942,6 +1964,7 @@ pub fn normalize(slots: Vec<Slot>) -> Vec<Segment> {
                 drop: slot.drop,
                 source_step: slot.source_step,
                 velocity: slot.velocity,
+                source: slot.source,
             }
         })
         .collect()
@@ -1984,6 +2007,7 @@ pub fn timed_events(segments: Vec<Segment>, cycle_factor: f64) -> Vec<TimedEvent
             event: segment.event,
             drop: segment.drop,
             velocity: segment.velocity,
+            source: segment.source,
         })
         .collect()
 }
@@ -2156,6 +2180,7 @@ pub fn arpeggiate(segments: &mut Vec<Segment>, mode: ArpMode) {
                 drop: segment.drop,
                 source_step: segment.source_step,
                 velocity: segment.velocity,
+                source: segment.source,
             });
         }
     }
@@ -2270,12 +2295,16 @@ pub fn resolve_events_at(
             end: 1.0,
             notes: vec![60],
             velocity: None,
+            source: None,
+            trigger: true,
         }],
         Event::Notes(notes) => vec![ResolvedEvent {
             start: 0.0,
             end: 1.0,
             notes: notes.clone(),
             velocity: None,
+            source: None,
+            trigger: false,
         }],
         Event::Alternatives(options) if !options.is_empty() => {
             let option = &options[alternation_cycle as usize % options.len()];
@@ -2325,6 +2354,8 @@ pub fn solo_events(
             end: (i + 1) as f64 / steps as f64,
             notes: vec![notes[index.clamp(0, len - 1) as usize]],
             velocity: None,
+            source: None,
+            trigger: false,
         });
         // Movement-biased deltas: mostly step by one, sometimes leap, rarely
         // repeat. Cumulative weights over [-2, -1, 0, +1, +2].
@@ -2397,6 +2428,8 @@ pub fn resolve_option_at(
                 // An inner step's own velocity wins; otherwise the enclosing
                 // step's carries down into everything it sounds.
                 velocity: nested.velocity.or(timed.velocity),
+                source: nested.source.or(Some(timed.source)),
+                trigger: nested.trigger,
             });
         }
     }
