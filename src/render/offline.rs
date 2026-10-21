@@ -32,7 +32,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, mpsc};
 
-use crate::ast::PatternDef;
+use crate::ast::{FxArg, FxValue, PatternDef, Ramp, Transform};
 use crate::piece::{Piece, Section};
 use treble::app::prelude::{AudioGraph, AutomationSpec, AutomationTarget, BusSpec, ParameterRamp};
 use treble::audio::{EventScheduler, InstrumentAudioMessage, render_block};
@@ -41,8 +41,9 @@ use treble::core::{Block, Note};
 use treble::instruments::prelude::InstrumentRegistry;
 
 use super::compile::{
-    CompiledPattern, LineTravel, NOTE_GATE, PatternGate, RampWindow, Travel, compile_pattern,
-    core_curve, cycle_seconds, cycle_strikes_at, fx_ramp_window, pattern_fx, transform_travels,
+    CompiledPattern, LineTravel, NOTE_GATE, PatternGate, RampWindow, Strike, Travel,
+    compile_pattern, core_curve, cycle_seconds, cycle_strikes_at, fx_ramp_window, pattern_fx,
+    transform_travels, travel_f64,
 };
 
 /// A rendered piece: interleaved stereo samples plus what they came from.
@@ -501,7 +502,7 @@ fn mix_and_limit(
 }
 
 /// How many frames one of a section's cycles lasts.
-fn section_cycle_frames(section: &Section, sample_rate: u32) -> u64 {
+pub(crate) fn section_cycle_frames(section: &Section, sample_rate: u32) -> u64 {
     (cycle_seconds(section.bpm, section.sig) * f64::from(sample_rate)).round() as u64
 }
 
@@ -682,6 +683,32 @@ mod tests {
             peak(&piece, 0, 44_100) > 0.001,
             "the first second is silent"
         );
+    }
+
+    #[test]
+    fn section_strikes_point_back_at_the_written_steps() {
+        let source = "bpm 120\ntail 0\nsection a 2 {\n  bass sine \"<c3 [e3 g3]> ~\" @ 2\n  hat sine \"c5*2\"\n}\n";
+        let (program, errors) = crate::parser::parse_program(source);
+        assert!(errors.is_empty(), "parse: {errors:?}");
+        let (piece, errors) = crate::piece::resolve(&program, (120, (4, 4), None));
+        assert!(errors.is_empty(), "resolve: {errors:?}");
+        let lines = vec!["bass".to_string()];
+        let strikes = section_strikes(&piece, &InstrumentRegistry::built_in(), 0, Some(&lines))
+            .expect("strikes");
+        assert_eq!(strikes.len(), 1, "only the line asked for");
+        let notation = "<c3 [e3 g3]> ~";
+        let written: Vec<(u32, &str)> = strikes[0]
+            .strikes
+            .iter()
+            .map(|(cycle, strike)| {
+                (
+                    *cycle,
+                    &notation[strike.source.start as usize..strike.source.end as usize],
+                )
+            })
+            .collect();
+        // `@ 2` keeps it to the second bar, where the alternation is on `[e3 g3]`.
+        assert_eq!(written, vec![(1, "e3"), (1, "g3")]);
     }
 
     /// The pitches a source schedules, in order, for one named line.
@@ -915,52 +942,21 @@ pub fn scheduled_notes(
             .chain(&piece.throughout)
             .filter(|line| !line.muted && !section.muted)
         {
-            let travel = LineTravel {
-                line: Travel::START,
-                cycle: origin_cycle as f64,
-                origin: origin_cycle,
-                divisions: section.sig.0,
-            };
-            let (audio_fx, fx_ramps) =
-                pattern_fx(&line.transforms, section.cycle_seconds(), travel)
-                    .map_err(|error| format!("'{}': {error}", line.name))?;
-            let spec = registry
-                .get(&line.instrument)
-                .ok_or_else(|| format!("'{}': unknown instrument", line.name))?
-                .clone();
-            let instrument_fx = spec.fx.len();
-            let compiled = compile_pattern(
-                line,
-                section.scale,
-                audio_fx,
-                fx_ramps,
-                instrument_fx,
-                spec,
-                PatternGate::default(),
-                origin_cycle,
-                section.sig.0,
-                piece.seed,
-            );
-            let from = line.span.map_or(1, |s| s.start());
-            let to = line.span.map_or(section.cycles, |s| s.end(section.cycles));
-            for cycle in from..=to.min(section.cycles) {
-                let absolute = origin_cycle + u64::from(cycle - 1);
-                let within_section = u64::from(cycle - 1);
-                let cycle_start = at_frame + u64::from(cycle - 1) * cycle_frames;
-                for strike in cycle_strikes_at(&compiled, absolute, within_section) {
-                    let start = cycle_start + (strike.start * cycle_frames as f64).round() as u64;
-                    let end = start
-                        + ((strike.end - strike.start) * NOTE_GATE * cycle_frames as f64).round()
-                            as u64;
-                    for midi in strike.notes {
-                        notes.push(ScheduledNote {
-                            start,
-                            end: end.max(start + 1),
-                            midi,
-                            line: line.name.clone(),
-                            section: section.name.clone(),
-                        });
-                    }
+            let compiled = compile_line(piece, section, line, registry, origin_cycle)?;
+            for (cycle, strike) in line_strikes(section, line, &compiled, origin_cycle) {
+                let cycle_start = at_frame + u64::from(cycle) * cycle_frames;
+                let start = cycle_start + (strike.start * cycle_frames as f64).round() as u64;
+                let end = start
+                    + ((strike.end - strike.start) * NOTE_GATE * cycle_frames as f64).round()
+                        as u64;
+                for midi in strike.notes {
+                    notes.push(ScheduledNote {
+                        start,
+                        end: end.max(start + 1),
+                        midi,
+                        line: line.name.clone(),
+                        section: section.name.clone(),
+                    });
                 }
             }
         }
@@ -968,6 +964,256 @@ pub fn scheduled_notes(
     }
     notes.sort_by_key(|note| (note.start, note.midi));
     Ok(notes)
+}
+
+/// What one line of one section strikes, as an editor draws it.
+///
+/// The section is taken at its first playing in the arrangement — or at the
+/// start of the piece when it is never played — because travels, drops and
+/// choices count from there, and a line heard on its own should sound the way
+/// it does in the song. Muted lines are included: asking for a line by name
+/// is asking to see it.
+pub fn section_strikes(
+    piece: &Piece,
+    registry: &InstrumentRegistry,
+    section: usize,
+    lines: Option<&[String]>,
+) -> Result<Vec<LineStrikes>, String> {
+    let placed = &piece.sections[section];
+    let origin_cycle = first_playing(piece, section);
+    placed
+        .patterns
+        .iter()
+        .filter(|line| lines.is_none_or(|names| names.contains(&line.name)))
+        .map(|line| {
+            let compiled = compile_line(piece, placed, line, registry, origin_cycle)?;
+            let strikes = line_strikes(placed, line, &compiled, origin_cycle).collect();
+            Ok(LineStrikes {
+                line: line.name.clone(),
+                instrument: line.instrument.clone(),
+                strikes,
+                automations: line_automations(placed, line, &compiled, origin_cycle),
+            })
+        })
+        .collect()
+}
+
+/// The absolute cycle a section first starts on, or 0 when it never plays.
+pub fn first_playing(piece: &Piece, section: usize) -> u64 {
+    piece
+        .timeline
+        .iter()
+        .find(|occurrence| occurrence.section == section)
+        .map_or(0, |occurrence| occurrence.start_cycle)
+}
+
+/// One line's strikes over its section, each with the 0-based cycle within
+/// the section it falls in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineStrikes {
+    pub line: String,
+    pub instrument: String,
+    pub strikes: Vec<(u32, Strike)>,
+    /// The line's values that travel, as the renderer moves them.
+    pub automations: Vec<Automation>,
+}
+
+/// One travelling value on a line — `lpf 900..2600`, `vel 0.4>0.7>1.0`, an
+/// `r(...)` argument — sampled across the cycles the line sounds on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Automation {
+    /// What moves: `lpf`, `delay time`, `fx Tremolo depth`.
+    pub label: String,
+    /// `Hz`, `s`, or empty for a plain level.
+    pub unit: &'static str,
+    /// The lowest and highest value it passes through.
+    pub low: f64,
+    pub high: f64,
+    /// `(cycle within the section, value)`, in order.
+    pub points: Vec<(f64, f64)>,
+}
+
+/// How many samples a cycle gets: enough for a sweep to read as a curve. A
+/// value with its own `r(...)` window may move within a beat, so it gets more.
+const SAMPLES_PER_CYCLE: u32 = 16;
+const SAMPLES_PER_CYCLE_TIMED: u32 = 64;
+
+/// Every travelling value on a line, sampled with the same travel the
+/// renderer uses, over the cycles the line's span allows.
+fn line_automations(
+    section: &Section,
+    line: &PatternDef,
+    compiled: &CompiledPattern,
+    origin_cycle: u64,
+) -> Vec<Automation> {
+    let mut found: Vec<(String, &'static str, Ramp<f64>)> = Vec::new();
+    for transform in &line.transforms {
+        travelling_values(transform, &mut found);
+    }
+    let from = line.span.map_or(1, |s| s.start());
+    let to = line
+        .span
+        .map_or(section.cycles, |s| s.end(section.cycles))
+        .min(section.cycles);
+    found
+        .into_iter()
+        .map(|(label, unit, ramp)| {
+            let per_cycle = if ramp.own_window().is_some() {
+                SAMPLES_PER_CYCLE_TIMED
+            } else {
+                SAMPLES_PER_CYCLE
+            };
+            let value_at = |within: f64| {
+                let travel = compiled.line_travel(origin_cycle as f64 + within);
+                travel_f64(&ramp, travel).start()
+            };
+            let mut points = Vec::new();
+            for cycle in from..=to {
+                for sample in 0..per_cycle {
+                    let within = f64::from(cycle - 1) + f64::from(sample) / f64::from(per_cycle);
+                    points.push((within, value_at(within)));
+                }
+            }
+            let end = f64::from(to);
+            points.push((end, value_at(end - 1e-9)));
+            let values = ramp.values();
+            let low = values.iter().copied().fold(f64::INFINITY, f64::min);
+            let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            Automation {
+                label,
+                unit,
+                low,
+                high,
+                points,
+            }
+        })
+        .collect()
+}
+
+/// The values on a transform that travel, labelled for an editor.
+fn travelling_values(transform: &Transform, found: &mut Vec<(String, &'static str, Ramp<f64>)>) {
+    let mut push = |label: &str, unit: &'static str, ramp: &Ramp<f64>| {
+        if ramp.travels() {
+            found.push((label.to_string(), unit, ramp.clone()));
+        }
+    };
+    match transform {
+        Transform::Vel(ramp) => push("vel", "", ramp),
+        Transform::Gain(ramp) => push("gain", "", ramp),
+        Transform::Pan(ramp) => push("pan", "", ramp),
+        Transform::Lpf(ramp) => push("lpf", "Hz", ramp),
+        Transform::Hpf(ramp) => push("hpf", "Hz", ramp),
+        Transform::Reverb(ramp) => push("reverb", "", ramp),
+        Transform::Fast(ramp) => push("fast", "", ramp),
+        Transform::Slow(ramp) => push("slow", "", ramp),
+        Transform::Oct(ramp) => push("oct", "", &ramp_as_f64(ramp)),
+        Transform::Delay(time, feedback, mix) => {
+            push("delay time", "s", time);
+            push("delay feedback", "", feedback);
+            if let Some(mix) = mix {
+                push("delay mix", "", mix);
+            }
+        }
+        Transform::Fx(call) => {
+            for (index, arg) in call.args.iter().enumerate() {
+                let (name, value) = match arg {
+                    FxArg::Positional(value) => (format!("#{}", index + 1), value),
+                    FxArg::Named(name, value) => (name.clone(), value),
+                };
+                let unit = match value {
+                    FxValue::Hertz(_) => "Hz",
+                    FxValue::Plain(_) => "",
+                };
+                push(&format!("fx {} {name}", call.filter), unit, value.ramp());
+            }
+        }
+        // `every` applies on some cycles only; drawing it as a smooth travel
+        // would misdescribe it.
+        _ => {}
+    }
+}
+
+fn ramp_as_f64(ramp: &Ramp<i32>) -> Ramp<f64> {
+    match ramp {
+        Ramp::Fixed(value) => Ramp::Fixed(f64::from(*value)),
+        Ramp::Sweep { from, to } => Ramp::Sweep {
+            from: f64::from(*from),
+            to: f64::from(*to),
+        },
+        Ramp::Steps { first, rest } => Ramp::Steps {
+            first: f64::from(*first),
+            rest: rest.iter().copied().map(f64::from).collect(),
+        },
+        Ramp::Timed {
+            ramp,
+            span_divisions,
+            curve,
+        } => Ramp::Timed {
+            ramp: Box::new(ramp_as_f64(ramp)),
+            span_divisions: *span_divisions,
+            curve: *curve,
+        },
+    }
+}
+
+/// Compile one line the way an occurrence starting on `origin_cycle` plays it.
+fn compile_line(
+    piece: &Piece,
+    section: &Section,
+    line: &PatternDef,
+    registry: &InstrumentRegistry,
+    origin_cycle: u64,
+) -> Result<CompiledPattern, String> {
+    let travel = LineTravel {
+        line: Travel::START,
+        cycle: origin_cycle as f64,
+        origin: origin_cycle,
+        divisions: section.sig.0,
+    };
+    let (audio_fx, fx_ramps) = pattern_fx(&line.transforms, section.cycle_seconds(), travel)
+        .map_err(|error| format!("'{}': {error}", line.name))?;
+    let spec = registry
+        .get(&line.instrument)
+        .ok_or_else(|| format!("'{}': unknown instrument", line.name))?
+        .clone();
+    let instrument_fx = spec.fx.len();
+    Ok(compile_pattern(
+        line,
+        section.scale,
+        audio_fx,
+        fx_ramps,
+        instrument_fx,
+        spec,
+        PatternGate::default(),
+        origin_cycle,
+        section.sig.0,
+        piece.seed,
+    ))
+}
+
+/// Every strike of a compiled line across the cycles its span allows, with the
+/// 0-based cycle within the section each falls in.
+fn line_strikes<'a>(
+    section: &Section,
+    line: &PatternDef,
+    compiled: &'a CompiledPattern,
+    origin_cycle: u64,
+) -> impl Iterator<Item = (u32, Strike)> + 'a {
+    let from = line.span.map_or(1, |s| s.start());
+    let to = line
+        .span
+        .map_or(section.cycles, |s| s.end(section.cycles))
+        .min(section.cycles);
+    (from..=to).flat_map(move |cycle| {
+        let within = cycle - 1;
+        cycle_strikes_at(
+            compiled,
+            origin_cycle + u64::from(within),
+            u64::from(within),
+        )
+        .into_iter()
+        .map(move |strike| (within, strike))
+    })
 }
 
 /// One scheduled note, with enough context to reason about it.
