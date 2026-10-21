@@ -1252,15 +1252,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
-name = "ppv-lite86"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
-dependencies = [
- "zerocopy",
-]
-
-[[package]]
 name = "pretty_assertions"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1309,18 +1300,6 @@ version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
- "libc",
- "rand_chacha",
- "rand_core",
-]
-
-[[package]]
-name = "rand_chacha"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
-dependencies = [
- "ppv-lite86",
  "rand_core",
 ]
 
@@ -1329,9 +1308,6 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
-dependencies = [
- "getrandom 0.2.17",
-]
 
 [[package]]
 name = "rayon"
@@ -1703,7 +1679,8 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 [[package]]
 name = "treble"
 version = "0.4.3"
-source = "git+https://github.com/MinIndustry/treble-core.git?tag=0.4.3#c5f7f5aad9db8401537d21f1b799c9d8308e04cb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34de91aaf2e7d7c69881b6b79cfc4651af6bffd4fe8e0f173bbacd5ed7d9fbd9"
 dependencies = [
  "atomic_float",
  "chrono",
@@ -1729,7 +1706,8 @@ dependencies = [
 [[package]]
 name = "treble-derive"
 version = "0.2.0"
-source = "git+https://github.com/MinIndustry/treble-derive.git?tag=0.2.0#c99839c3e84f0eeeba08aea503a62d08a284c4fb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aef642c297c775e655952084901ab703f7f707ae4fad6da59c94cfd3fa87c93f"
 dependencies = [
  "convert_case",
  "proc-macro2",
@@ -1753,7 +1731,8 @@ dependencies = [
 [[package]]
 name = "treble-meta"
 version = "0.2.0"
-source = "git+https://github.com/MinIndustry/treble-meta.git?tag=0.2.0#22c3f4933d24eaa814ee72c0e03045ed6dfcfce7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d4c5ae50588a53b88109f9089ac62189c276de46fa35b43fb1b4c7706432f01"
 dependencies = [
  "proc-macro2",
  "quote",
