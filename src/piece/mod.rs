@@ -192,6 +192,44 @@ impl Piece {
         }
     }
 
+    /// Every instrument a line plays in the sections the arrangement plays,
+    /// or throughout them, sorted and without repeats. Muted lines count: the
+    /// instrument is written there, whether or not it sounds.
+    pub fn played_instruments(&self) -> Vec<&str> {
+        let mut played: Vec<usize> = self.timeline.iter().map(|o| o.section).collect();
+        played.sort_unstable();
+        played.dedup();
+        let mut instruments: Vec<&str> = played
+            .into_iter()
+            .flat_map(|index| &self.sections[index].patterns)
+            .chain(&self.throughout)
+            .map(|line| line.instrument.as_str())
+            .collect();
+        instruments.sort_unstable();
+        instruments.dedup();
+        instruments
+    }
+
+    /// Mute every line — in a section, in a group or throughout — whose
+    /// instrument is not one of `keep`.
+    ///
+    /// The piece keeps its length, its timing and every line's place, so what
+    /// is left sounds exactly as it does in the full mix; only the other
+    /// instruments fall silent. Groups keep their buses, so a kept line still
+    /// goes through its group's filters (§7).
+    pub fn mute_except(&mut self, keep: &[&str]) {
+        for line in self
+            .sections
+            .iter_mut()
+            .flat_map(|section| section.patterns.iter_mut())
+            .chain(self.throughout.iter_mut())
+        {
+            if !keep.contains(&line.instrument.as_str()) {
+                line.muted = true;
+            }
+        }
+    }
+
     /// Walk the timeline, yielding each occurrence with its section and the
     /// second it starts at.
     ///

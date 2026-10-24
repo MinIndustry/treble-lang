@@ -32,6 +32,8 @@ RENDER OPTIONS:
                          only the last pass and its tail — a loop whose start
                          carries what the pass before it left ringing.
                          Default 1.
+        --only <a,b>     Mute every line whose instrument is not listed. An
+                         instrument no rendered line plays is an error.
     -f, --force          Overwrite the output if it exists.
     -q, --quiet          Only report errors.
         --json           Emit a machine-readable summary on stdout.
@@ -330,6 +332,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     let mut extra: Vec<(String, String)> = Vec::new();
     let mut section: Option<String> = None;
     let mut passes: u32 = 1;
+    let mut only: Vec<String> = Vec::new();
     let (mut force, mut quiet, mut json) = (false, false, false);
 
     let mut i = 0;
@@ -365,6 +368,19 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                 passes = value.parse().ok().filter(|&n| n >= 1).ok_or_else(|| {
                     format!("--passes: expected a count of 1 or more, got '{value}'")
                 })?;
+            }
+            "--only" => {
+                let value = take("--only")?;
+                only.extend(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string),
+                );
+                if only.is_empty() {
+                    return Err("--only: expected one or more instruments".into());
+                }
             }
             "-f" | "--force" => force = true,
             "-q" | "--quiet" => quiet = true,
@@ -435,6 +451,9 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     if let Some(name) = &section {
         let index = section_named(&piece, name, &input)?;
         piece = piece.isolate(index, passes);
+    }
+    if !only.is_empty() {
+        keep_only(&mut piece, &only)?;
     }
 
     if !quiet {
@@ -563,6 +582,32 @@ fn section_named(piece: &treble_lang::Piece, name: &str, input: &str) -> Result<
     })
 }
 
+/// Mute every line not played on one of `instruments`, refusing a name that
+/// no line of the rendered sections plays.
+///
+/// A typo in a build script would otherwise write a file of silence that looks
+/// like a successful render; the caller owns the mapping from its own groups
+/// to instruments, so it is the caller who has to hear about a stale one.
+#[cfg(feature = "render")]
+fn keep_only(piece: &mut treble_lang::Piece, instruments: &[String]) -> Result<(), String> {
+    let played = piece.played_instruments();
+    let missing: Vec<&str> = instruments
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !played.contains(name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "--only: no line plays {} here — the lines play {}",
+            missing.join(", "),
+            played.join(", ")
+        ));
+    }
+    let keep: Vec<&str> = instruments.iter().map(String::as_str).collect();
+    piece.mute_except(&keep);
+    Ok(())
+}
+
 /// A 24-cell progress bar. Written with block characters so it reads at a
 /// glance without needing a terminal library.
 #[cfg(feature = "render")]
@@ -643,6 +688,31 @@ mod render_option_tests {
             .collect();
         let error = cmd_render(&zero).expect_err("zero passes");
         assert!(error.contains("1 or more"), "{error}");
+    }
+
+    #[test]
+    fn only_mutes_the_other_instruments_and_refuses_a_stranger() {
+        let mut piece = piece_of(
+            "bpm 120\nsection a 2 {\n  k kick \"x\"\n  b bass \"c2\"\n}\n\
+             section sketch 1 {\n  p pad \"c3\"\n}\n\
+             hum sine \"c1\"\n\
+             arrange a\n",
+        );
+        let error =
+            keep_only(&mut piece.clone(), &["bass".into(), "basss".into()]).expect_err("a typo");
+        assert!(error.contains("basss"), "{error}");
+        assert!(error.contains("bass, kick, sine"), "{error}");
+        // `sketch` is never played, so its pad is not on offer.
+        assert!(keep_only(&mut piece.clone(), &["pad".into()]).is_err());
+
+        keep_only(&mut piece, &["bass".into(), "sine".into()]).expect("both play");
+        let muted: Vec<(&str, bool)> = piece.sections[0]
+            .patterns
+            .iter()
+            .chain(&piece.throughout)
+            .map(|line| (line.name.as_str(), line.muted))
+            .collect();
+        assert_eq!(muted, vec![("k", true), ("b", false), ("hum", false)]);
     }
 
     #[test]

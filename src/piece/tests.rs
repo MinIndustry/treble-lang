@@ -671,3 +671,27 @@ fn passes_follow_one_another_from_the_first_playing() {
     assert!((three.seconds() - 3.0 * full.sections[verse].seconds()).abs() < 1e-9);
     assert_eq!(full.isolate(verse, 0).timeline.len(), 1, "0 passes is one");
 }
+
+#[test]
+fn muting_all_but_some_instruments_keeps_grouped_lines_and_the_timing() {
+    let mut full = piece(
+        "bpm 120\nsection a 2 {\n  k kick \"x\"\n  group keys {\n    e epiano \"c4\"\n    \
+         p pad \"c3\"\n  } | reverb 0.3\n}\nhum sine \"c1\"\n",
+    );
+    assert_eq!(
+        full.played_instruments(),
+        vec!["epiano", "kick", "pad", "sine"]
+    );
+    let seconds = full.seconds();
+    full.mute_except(&["epiano"]);
+    let sounding: Vec<&str> = full.sections[0]
+        .patterns
+        .iter()
+        .chain(&full.throughout)
+        .filter(|line| !line.muted)
+        .map(|line| line.name.as_str())
+        .collect();
+    assert_eq!(sounding, vec!["e"]);
+    assert_eq!(full.sections[0].groups.len(), 1, "the bus stays");
+    assert_eq!(full.seconds(), seconds);
+}
