@@ -12,7 +12,7 @@ treble — the Treble language toolchain
 
 USAGE:
     treble check <file.rt>
-    treble info  <file.rt>
+    treble info  <file.rt> [--json]
     treble render <file.rt> [-o <out.wav>] [options]
     treble serve
 
@@ -21,6 +21,11 @@ COMMANDS:
     info      Print a piece's structure — sections, arrangement, metadata.
     render    Render a piece to a WAV file.
     serve     Speak LSP on stdin/stdout, with a player, for an editor.
+
+INFO OPTIONS:
+        --json           Print the structure as JSON on stdout: metadata, tail,
+                         seed, arrangement, timeline, and per section its
+                         timing, first cycle, occurrences and lines.
 
 RENDER OPTIONS:
     -o, --out <path>     Output file. Defaults to the input with a .wav suffix.
@@ -136,9 +141,24 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Print the structure the score editor draws, for a terminal.
+/// Print the structure the score editor draws, for a terminal or, with
+/// `--json`, for a build script.
 fn cmd_info(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or("info: expected a file")?;
+    let mut path: Option<&str> = None;
+    let mut json = false;
+    let mut only_positional = false;
+    for arg in args {
+        match arg.as_str() {
+            other if only_positional => path = Some(other),
+            "--" => only_positional = true,
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                return Err(format!("info: unknown option '{other}'"));
+            }
+            other => path = Some(other),
+        }
+    }
+    let path = path.ok_or("info: expected a file")?;
     let source = read(path)?;
     let mut session = treble_lang::Session::new();
     let result = session.evaluate(&source);
@@ -148,6 +168,15 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
     let piece = session
         .piece()
         .ok_or("that buffer has no sections, so there is no piece to describe")?;
+
+    if json {
+        let described = describe(piece, path);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&described).map_err(|error| error.to_string())?
+        );
+        return Ok(());
+    }
 
     if !piece.metadata.is_empty() {
         for (key, value) in &piece.metadata {
@@ -202,6 +231,95 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
         println!("\n  never played: {}", piece.unused.join(", "));
     }
     Ok(())
+}
+
+/// A piece's structure as JSON, for a build script that cuts it up.
+///
+/// Read off the resolved [`Piece`], so a script never has to parse the source
+/// or scrape the text `info` prints. Times are in seconds and cycles count
+/// from 0 at the start of the piece, as on the timeline; a span is the 1-based
+/// bars of its section it sounds on, inclusive (§8.3). The keys are camelCase,
+/// like `render --json`.
+fn describe(piece: &treble_lang::Piece, path: &str) -> serde_json::Value {
+    use serde_json::{Map, Value, json};
+
+    let line = |line: &treble_lang::PatternDef, cycles: Option<u32>| {
+        json!({
+            "name": line.name,
+            "instrument": line.instrument,
+            "group": line.group,
+            "muted": line.muted,
+            "span": match (line.span, cycles) {
+                (Some(span), Some(cycles)) => json!({
+                    "from": span.start(),
+                    "to": span.end(cycles).min(cycles),
+                }),
+                _ => Value::Null,
+            },
+        })
+    };
+    let metadata: Map<String, Value> = piece
+        .metadata
+        .iter()
+        .map(|(key, value)| (key.clone(), Value::from(value.as_str())))
+        .collect();
+    let sections: Vec<Value> = piece
+        .sections
+        .iter()
+        .enumerate()
+        .map(|(index, section)| {
+            let occurrences = piece.timeline.iter().filter(|o| o.section == index).count();
+            json!({
+                "name": section.name,
+                "muted": section.muted,
+                "cycles": section.cycles,
+                "bpm": section.bpm,
+                "sig": [section.sig.0, section.sig.1],
+                "seconds": section.seconds(),
+                "cycleSeconds": section.cycle_seconds(),
+                "firstCycle": piece.first_playing(index),
+                "occurrences": occurrences,
+                "groups": section.groups.iter().map(|group| json!({
+                    "name": group.name,
+                    "muted": group.muted,
+                })).collect::<Vec<_>>(),
+                "lines": section.patterns.iter()
+                    .map(|member| line(member, Some(section.cycles)))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let timeline: Vec<Value> = piece
+        .walk()
+        .map(|placed| {
+            json!({
+                "section": placed.section.name,
+                "startCycle": placed.start_cycle,
+                "startSeconds": placed.start_seconds,
+            })
+        })
+        .collect();
+
+    json!({
+        "path": path,
+        "title": piece.meta("title"),
+        "metadata": metadata,
+        "tail": piece.tail,
+        "seed": piece.seed,
+        "cycles": piece.total_cycles(),
+        "seconds": piece.seconds(),
+        "renderSeconds": piece.render_seconds(),
+        "arrangement": piece.arrangement.iter().map(|item| json!({
+            "section": item.section,
+            "repeat": item.repeat,
+        })).collect::<Vec<_>>(),
+        "timeline": timeline,
+        "sections": sections,
+        "throughout": piece.throughout.iter()
+            .map(|member| line(member, None))
+            .collect::<Vec<_>>(),
+        "unused": piece.unused,
+    })
 }
 
 /// Resolve the buffer's `load` lines into instrument definitions (§2.5).
@@ -774,5 +892,54 @@ mod render_option_tests {
         let error = section_named(&piece, "chorus", "p.rt").expect_err("no chorus");
         assert!(error.contains("'chorus'"), "{error}");
         assert!(error.contains("intro, verse"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod info_tests {
+    use super::*;
+
+    #[test]
+    fn the_json_describes_sections_where_they_first_play() {
+        let mut session = treble_lang::Session::new();
+        let result = session.evaluate(
+            "meta title \"Drift\"\nbpm 120\ntail 1.5\nseed 7\n\
+             section intro 2 {\n  k kick \"x\"\n}\n\
+             section verse 4 {\n  group keys {\n    e epiano \"c4\" @ 3..\n  } | reverb 0.2\n\
+             \x20 ; b bass \"c2\"\n}\n\
+             hum sine \"c1\"\n\
+             arrange intro*2 verse intro\n",
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let described = describe(session.piece().expect("a piece"), "p.rt");
+
+        assert_eq!(described["title"], "Drift");
+        assert_eq!(described["metadata"]["title"], "Drift");
+        assert_eq!(described["tail"], 1.5);
+        assert_eq!(described["seed"], 7);
+        assert_eq!(described["cycles"], 10);
+        assert_eq!(described["arrangement"][0]["repeat"], 2);
+        assert_eq!(described["timeline"][2]["section"], "verse");
+        assert_eq!(described["timeline"][2]["startCycle"], 4);
+        assert_eq!(described["timeline"][2]["startSeconds"], 8.0);
+
+        let verse = &described["sections"][1];
+        assert_eq!(verse["name"], "verse");
+        assert_eq!(verse["sig"], serde_json::json!([4, 4]));
+        assert_eq!(verse["cycleSeconds"], 2.0);
+        assert_eq!(verse["seconds"], 8.0);
+        assert_eq!(verse["firstCycle"], 4);
+        assert_eq!(verse["occurrences"], 1);
+        assert_eq!(described["sections"][0]["occurrences"], 3);
+        assert_eq!(
+            verse["lines"],
+            serde_json::json!([
+                {"name": "e", "instrument": "epiano", "group": "keys", "muted": false,
+                 "span": {"from": 3, "to": 4}},
+                {"name": "b", "instrument": "bass", "group": null, "muted": true, "span": null},
+            ])
+        );
+        assert_eq!(verse["groups"][0]["name"], "keys");
+        assert_eq!(described["throughout"][0]["instrument"], "sine");
     }
 }
