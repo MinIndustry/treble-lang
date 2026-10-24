@@ -12,7 +12,7 @@ treble — the Treble language toolchain
 
 USAGE:
     treble check <file.rt>
-    treble info  <file.rt> [--json]
+    treble info  <file.rt> [--json [--bars]]
     treble render <file.rt> [-o <out.wav>] [options]
     treble serve
 
@@ -26,6 +26,9 @@ INFO OPTIONS:
         --json           Print the structure as JSON on stdout: metadata, tail,
                          seed, arrangement, timeline, and per section its
                          timing, first cycle, occurrences and lines.
+        --bars           With --json: give each line of a section the bars it
+                         strikes on, as the section first plays. Needs the
+                         renderer.
 
 RENDER OPTIONS:
     -o, --out <path>     Output file. Defaults to the input with a .wav suffix.
@@ -146,17 +149,22 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
 fn cmd_info(args: &[String]) -> Result<(), String> {
     let mut path: Option<&str> = None;
     let mut json = false;
+    let mut bars = false;
     let mut only_positional = false;
     for arg in args {
         match arg.as_str() {
             other if only_positional => path = Some(other),
             "--" => only_positional = true,
             "--json" => json = true,
+            "--bars" => bars = true,
             other if other.starts_with('-') => {
                 return Err(format!("info: unknown option '{other}'"));
             }
             other => path = Some(other),
         }
+    }
+    if bars && !json {
+        return Err("--bars adds to the JSON, so it needs --json".into());
     }
     let path = path.ok_or("info: expected a file")?;
     let source = read(path)?;
@@ -170,7 +178,12 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
         .ok_or("that buffer has no sections, so there is no piece to describe")?;
 
     if json {
-        let described = describe(piece, path);
+        let bars = if bars {
+            Some(struck_bars(&session, piece, path)?)
+        } else {
+            None
+        };
+        let described = describe(piece, path, bars.as_deref());
         println!(
             "{}",
             serde_json::to_string_pretty(&described).map_err(|error| error.to_string())?
@@ -240,7 +253,14 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
 /// from 0 at the start of the piece, as on the timeline; a span is the 1-based
 /// bars of its section it sounds on, inclusive (§8.3). The keys are camelCase,
 /// like `render --json`.
-fn describe(piece: &treble_lang::Piece, path: &str) -> serde_json::Value {
+///
+/// With `bars` — per section, each line's name and whether it strikes on each
+/// bar — every section line also carries `bars`.
+fn describe(
+    piece: &treble_lang::Piece,
+    path: &str,
+    bars: Option<&[SectionBars]>,
+) -> serde_json::Value {
     use serde_json::{Map, Value, json};
 
     let line = |line: &treble_lang::PatternDef, cycles: Option<u32>| {
@@ -284,7 +304,16 @@ fn describe(piece: &treble_lang::Piece, path: &str) -> serde_json::Value {
                     "muted": group.muted,
                 })).collect::<Vec<_>>(),
                 "lines": section.patterns.iter()
-                    .map(|member| line(member, Some(section.cycles)))
+                    .map(|member| {
+                        let mut described = line(member, Some(section.cycles));
+                        if let Some(struck) = bars
+                            .and_then(|bars| bars.get(index))
+                            .and_then(|lines| lines.iter().find(|(name, _)| *name == member.name))
+                        {
+                            described["bars"] = json!(struck.1);
+                        }
+                        described
+                    })
                     .collect::<Vec<_>>(),
             })
         })
@@ -320,6 +349,52 @@ fn describe(piece: &treble_lang::Piece, path: &str) -> serde_json::Value {
             .collect::<Vec<_>>(),
         "unused": piece.unused,
     })
+}
+
+/// One section's lines, each with whether it strikes on each of the section's
+/// bars.
+type SectionBars = Vec<(String, Vec<bool>)>;
+
+/// Which bars each line of each section strikes on.
+///
+/// Read off [`section_strikes`](treble_lang::render::section_strikes), so a
+/// section is taken as it first plays — its drops and choices are the song's
+/// — and a muted line still says where it would strike. A bar a line's span
+/// excludes, or that its drops empty, is `false`.
+#[cfg(feature = "render")]
+fn struck_bars(
+    session: &treble_lang::Session,
+    piece: &treble_lang::Piece,
+    path: &str,
+) -> Result<Vec<SectionBars>, String> {
+    let registry = instrument_registry(session, piece, path)?;
+    (0..piece.sections.len())
+        .map(|index| {
+            let cycles = piece.sections[index].cycles as usize;
+            let lanes = treble_lang::render::section_strikes(piece, &registry, index, None)?;
+            Ok(lanes
+                .into_iter()
+                .map(|lane| {
+                    let mut bars = vec![false; cycles];
+                    for (cycle, _) in &lane.strikes {
+                        if let Some(bar) = bars.get_mut(*cycle as usize) {
+                            *bar = true;
+                        }
+                    }
+                    (lane.line, bars)
+                })
+                .collect())
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "render"))]
+fn struck_bars(
+    _session: &treble_lang::Session,
+    _piece: &treble_lang::Piece,
+    _path: &str,
+) -> Result<Vec<SectionBars>, String> {
+    Err("--bars reads the strikes the renderer schedules — rebuild with `--features render`".into())
 }
 
 /// Resolve the buffer's `load` lines into instrument definitions (§2.5).
@@ -563,28 +638,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
 
     // `def` blocks in the buffer are lowered into the registry the renderer
     // reads, so a piece can carry its own instruments.
-    let mut registry = treble::instruments::prelude::InstrumentRegistry::built_in();
-    // A definition's own cycle-relative rates resolve against the opening
-    // tempo. Sections may differ, but an instrument is defined once for the
-    // whole piece, so there is one cycle length to read it against.
-    let cycle = piece
-        .sections
-        .first()
-        .map_or(2.0, |section| section.cycle_seconds());
-    for definition in &loaded_definitions(&session, Path::new(&input))? {
-        let spec = treble_lang::render::compile::lower_instrument_def(definition, cycle)
-            .map_err(|error| format!("def {}: {error}", definition.name))?;
-        registry
-            .register(spec)
-            .map_err(|error| format!("def {}: {error}", definition.name))?;
-    }
-    for definition in session.definitions().values() {
-        let spec = treble_lang::render::compile::lower_instrument_def(definition, cycle)
-            .map_err(|error| format!("def {}: {error}", definition.name))?;
-        registry
-            .register(spec)
-            .map_err(|error| format!("def {}: {error}", definition.name))?;
-    }
+    let registry = instrument_registry(&session, &piece, &input)?;
 
     // Cut down after the registry is built: a definition's rates resolve
     // against the piece's opening tempo, not the tempo of the part rendered.
@@ -725,6 +779,33 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The built-in instruments plus the buffer's `def` blocks and whatever its
+/// `load` lines bring in, lowered onto the engine.
+#[cfg(feature = "render")]
+fn instrument_registry(
+    session: &treble_lang::Session,
+    piece: &treble_lang::Piece,
+    input: &str,
+) -> Result<treble::instruments::prelude::InstrumentRegistry, String> {
+    let mut registry = treble::instruments::prelude::InstrumentRegistry::built_in();
+    // A definition's own cycle-relative rates resolve against the opening
+    // tempo. Sections may differ, but an instrument is defined once for the
+    // whole piece, so there is one cycle length to read it against.
+    let cycle = piece
+        .sections
+        .first()
+        .map_or(2.0, |section| section.cycle_seconds());
+    let loaded = loaded_definitions(session, Path::new(input))?;
+    for definition in loaded.iter().chain(session.definitions().values()) {
+        let spec = treble_lang::render::compile::lower_instrument_def(definition, cycle)
+            .map_err(|error| format!("def {}: {error}", definition.name))?;
+        registry
+            .register(spec)
+            .map_err(|error| format!("def {}: {error}", definition.name))?;
+    }
+    Ok(registry)
 }
 
 /// The index of the section `--section` asked for, or an error naming the
@@ -911,7 +992,7 @@ mod info_tests {
              arrange intro*2 verse intro\n",
         );
         assert!(result.errors.is_empty(), "{:?}", result.errors);
-        let described = describe(session.piece().expect("a piece"), "p.rt");
+        let described = describe(session.piece().expect("a piece"), "p.rt", None);
 
         assert_eq!(described["title"], "Drift");
         assert_eq!(described["metadata"]["title"], "Drift");
@@ -941,5 +1022,36 @@ mod info_tests {
         );
         assert_eq!(verse["groups"][0]["name"], "keys");
         assert_eq!(described["throughout"][0]["instrument"], "sine");
+    }
+}
+
+#[cfg(all(test, feature = "render"))]
+mod bars_tests {
+    use super::*;
+
+    #[test]
+    fn each_line_says_which_bars_it_strikes_on() {
+        let mut session = treble_lang::Session::new();
+        let result = session.evaluate(
+            "bpm 120\nsection a 4 {\n  k kick \"x\"\n  late sine \"c4\" @ 3\n  \
+             gap sine \"<c4 ~ c4 ~>\"\n}\n",
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let piece = session.piece().expect("a piece");
+        let bars = struck_bars(&session, piece, "p.rt").expect("bars");
+        let described = describe(piece, "p.rt", Some(&bars));
+        let lines = &described["sections"][0]["lines"];
+        assert_eq!(
+            lines[0]["bars"],
+            serde_json::json!([true, true, true, true])
+        );
+        assert_eq!(
+            lines[1]["bars"],
+            serde_json::json!([false, false, true, false])
+        );
+        assert_eq!(
+            lines[2]["bars"],
+            serde_json::json!([true, false, true, false])
+        );
     }
 }
