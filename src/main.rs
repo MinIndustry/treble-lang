@@ -32,6 +32,8 @@ RENDER OPTIONS:
                          only the last pass and its tail — a loop whose start
                          carries what the pass before it left ringing.
                          Default 1.
+    -t, --tail <seconds> Ring out this long past the last cycle instead of the
+                         piece's own `tail` (§8.7).
         --only <a,b>     Mute every line whose instrument is not listed. An
                          instrument no rendered line plays is an error.
     -f, --force          Overwrite the output if it exists.
@@ -333,6 +335,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     let mut section: Option<String> = None;
     let mut passes: u32 = 1;
     let mut only: Vec<String> = Vec::new();
+    let mut tail: Option<f64> = None;
     let (mut force, mut quiet, mut json) = (false, false, false);
 
     let mut i = 0;
@@ -368,6 +371,18 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                 passes = value.parse().ok().filter(|&n| n >= 1).ok_or_else(|| {
                     format!("--passes: expected a count of 1 or more, got '{value}'")
                 })?;
+            }
+            "-t" | "--tail" => {
+                let value = take("--tail")?;
+                tail = Some(
+                    value
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                        .ok_or_else(|| {
+                            format!("--tail: expected seconds, 0 or more, got '{value}'")
+                        })?,
+                );
             }
             "--only" => {
                 let value = take("--only")?;
@@ -454,6 +469,11 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     }
     if !only.is_empty() {
         keep_only(&mut piece, &only)?;
+    }
+    // Like `-m`, the command line wins over the file: a loop for a game wants
+    // its tail decided by the build, not by how the piece ends.
+    if let Some(seconds) = tail {
+        piece.tail = seconds;
     }
 
     if !quiet {
@@ -713,6 +733,18 @@ mod render_option_tests {
             .map(|line| (line.name.as_str(), line.muted))
             .collect();
         assert_eq!(muted, vec![("k", true), ("b", false), ("hum", false)]);
+    }
+
+    #[test]
+    fn a_tail_must_be_a_length() {
+        for bad in ["-1", "soon", "inf", "NaN"] {
+            let args: Vec<String> = ["missing.rt", "--tail", bad]
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect();
+            let error = cmd_render(&args).expect_err(bad);
+            assert!(error.contains("--tail"), "{bad}: {error}");
+        }
     }
 
     #[test]
