@@ -626,7 +626,7 @@ fn an_isolated_section_starts_where_the_song_first_plays_it() {
     let verse = full.section_index("verse").expect("verse");
     assert_eq!(full.first_playing(verse), 6);
 
-    let alone = full.isolate(verse);
+    let alone = full.isolate(verse, 1);
     assert_eq!(alone.sections.len(), 1);
     assert_eq!(alone.sections[0].name, "verse");
     assert_eq!(
@@ -652,6 +652,22 @@ fn a_section_never_played_is_isolated_from_cycle_0() {
         "section a 2 {\n  x kick \"x\"\n}\nsection sketch 2 {\n  y kick \"x\"\n}\narrange a a\n",
     );
     let sketch = full.section_index("sketch").expect("sketch");
-    assert_eq!(full.isolate(sketch).timeline[0].start_cycle, 0);
+    assert_eq!(full.isolate(sketch, 1).timeline[0].start_cycle, 0);
     assert_eq!(full.section_index("chorus"), None);
+}
+
+#[test]
+fn passes_follow_one_another_from_the_first_playing() {
+    let full = piece(
+        "bpm 120\nsection intro 2 {\n  a kick \"x\"\n}\n\
+         section verse 4 {\n  b kick \"x\"\n}\n\
+         arrange intro verse\n",
+    );
+    let verse = full.section_index("verse").expect("verse");
+    let three = full.isolate(verse, 3);
+    let starts: Vec<u64> = three.timeline.iter().map(|o| o.start_cycle).collect();
+    assert_eq!(starts, vec![2, 6, 10]);
+    assert_eq!(three.arrangement[0].repeat, 3);
+    assert!((three.seconds() - 3.0 * full.sections[verse].seconds()).abs() < 1e-9);
+    assert_eq!(full.isolate(verse, 0).timeline.len(), 1, "0 passes is one");
 }

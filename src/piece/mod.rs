@@ -152,29 +152,37 @@ impl Piece {
             .map_or(0, |occurrence| occurrence.start_cycle)
     }
 
-    /// This piece cut down to one section, heard where the song first plays it.
+    /// This piece cut down to one section, heard where the song first plays it
+    /// and then `passes` times back to back.
     ///
-    /// The occurrence keeps the section's absolute starting cycle rather than
-    /// starting from 0: choices, drops and solos count from an occurrence's
-    /// place in the piece (§3.12, §3.15, §3.19, §8.8), so a section rendered as
-    /// a fresh piece would not sound the way it does in the song. The rule is
-    /// the editor's — a section never played is taken from cycle 0.
+    /// The first occurrence keeps the section's absolute starting cycle rather
+    /// than starting from 0: choices, drops and solos count from an
+    /// occurrence's place in the piece (§3.12, §3.15, §3.19, §8.8), so a
+    /// section rendered as a fresh piece would not sound the way it does in
+    /// the song. The rule is the editor's — a section never played is taken
+    /// from cycle 0. Each further pass follows on the next cycle, exactly as
+    /// `arrange <section>*<passes>` would place it. `passes` below 1 is taken
+    /// as 1.
     ///
     /// Lines outside every section still sound under it, as they do in the
     /// song, and the metadata travels so a render of the part is still filed
     /// under the piece. Every other section is dropped, so nothing is reported
     /// as never played.
-    pub fn isolate(&self, section: usize) -> Piece {
+    pub fn isolate(&self, section: usize, passes: u32) -> Piece {
         let kept = self.sections[section].clone();
+        let passes = passes.max(1);
+        let origin = self.first_playing(section);
         Piece {
             arrangement: vec![ArrangeItem {
                 section: kept.name.clone(),
-                repeat: 1,
+                repeat: passes,
             }],
-            timeline: vec![Occurrence {
-                section: 0,
-                start_cycle: self.first_playing(section),
-            }],
+            timeline: (0..passes)
+                .map(|pass| Occurrence {
+                    section: 0,
+                    start_cycle: origin + u64::from(pass) * u64::from(kept.cycles),
+                })
+                .collect(),
             sections: vec![kept],
             throughout: self.throughout.clone(),
             tail: self.tail,

@@ -67,6 +67,40 @@ pub struct RenderedPiece {
     pub telemetry: RenderTelemetry,
 }
 
+impl RenderedPiece {
+    /// Drop the first `frames` frames, so the render starts there.
+    ///
+    /// For keeping one pass of a section rendered several times over: cut at
+    /// [`occurrence_start_frame`], the first frame of the kept pass already
+    /// carries whatever the pass before it left ringing, which is what a loop
+    /// played back to back sounds like. The arrangement length shrinks by what
+    /// was dropped; the counts and telemetry still describe the render as made.
+    pub fn trim_start(&mut self, frames: u64) {
+        let samples = (frames as usize * 2).min(self.samples.len());
+        self.samples.drain(..samples);
+        let dropped = (samples / 2) as f64 / f64::from(self.sample_rate);
+        self.seconds = (self.seconds - dropped).max(0.0);
+        self.rendered_seconds = (self.samples.len() / 2) as f64 / f64::from(self.sample_rate);
+    }
+}
+
+/// The frame the `index`th occurrence of the timeline starts on.
+///
+/// Counted with the renderer's own arithmetic — whole frames per cycle, summed
+/// occurrence by occurrence — so cutting a render here lands on the sample the
+/// occurrence was scheduled from, not one rounded from seconds.
+pub fn occurrence_start_frame(piece: &Piece, index: usize, sample_rate: u32) -> u64 {
+    piece
+        .timeline
+        .iter()
+        .take(index)
+        .map(|occurrence| {
+            let section = &piece.sections[occurrence.section];
+            section_cycle_frames(section, sample_rate) * u64::from(section.cycles)
+        })
+        .sum()
+}
+
 /// Evidence about the work and headroom of an offline render.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RenderTelemetry {
@@ -818,7 +852,7 @@ mod tests {
             .filter(|note| note.section == "verse")
             .map(|note| (note.start - offset, note.midi))
             .collect();
-        let alone: Vec<(u64, u8)> = scheduled_notes(&piece.isolate(verse), &registry, 44_100)
+        let alone: Vec<(u64, u8)> = scheduled_notes(&piece.isolate(verse, 1), &registry, 44_100)
             .expect("notes")
             .into_iter()
             .map(|note| (note.start, note.midi))
@@ -828,7 +862,7 @@ mod tests {
 
         // The same section from cycle 0 is a different take — which is the
         // whole reason the occurrence keeps its place.
-        let mut from_zero = piece.isolate(verse);
+        let mut from_zero = piece.isolate(verse, 1);
         from_zero.timeline[0].start_cycle = 0;
         let fresh: Vec<(u64, u8)> = scheduled_notes(&from_zero, &registry, 44_100)
             .expect("notes")
@@ -836,6 +870,62 @@ mod tests {
             .map(|note| (note.start, note.midi))
             .collect();
         assert_ne!(fresh, in_song, "the choices did not depend on the cycle");
+    }
+
+    /// Two passes render two sections' worth plus the tail; trimming at the
+    /// second pass leaves exactly one pass plus the tail, and those samples
+    /// are the render's own, not a re-render.
+    #[test]
+    fn the_last_pass_is_cut_on_the_frame_it_was_scheduled_from() {
+        // 100 bpm makes a cycle 2.4 s, 105_840 frames: a cut computed from
+        // seconds would have to round, the renderer's own count does not.
+        let source = "bpm 100\ntail 0.5\n\
+             section intro 1 {\n  k kick \"x\"\n}\n\
+             section verse 2 {\n  pad pad \"[c3,e3,g3]\"\n  hat hihat \"x*4\"\n}\n\
+             arrange intro verse\n";
+        let (program, errors) = crate::parser::parse_program(source);
+        assert!(errors.is_empty(), "parse: {errors:?}");
+        let (piece, errors) = crate::piece::resolve(&program, (120, (4, 4), None));
+        assert!(errors.is_empty(), "resolve: {errors:?}");
+        let verse = piece.section_index("verse").expect("verse");
+        let section = &piece.sections[verse];
+        let pass_frames = section_cycle_frames(section, 44_100) * u64::from(section.cycles);
+        let tail_frames = (0.5f64 * 44_100.0).round() as u64;
+
+        let twice = piece.isolate(verse, 2);
+        assert!((twice.seconds() - 2.0 * section.seconds()).abs() < 1e-9);
+        let mut rendered = render(&twice, &InstrumentRegistry::built_in(), 44_100).expect("render");
+        assert_eq!(
+            rendered.samples.len() as u64,
+            (2 * pass_frames + tail_frames) * 2
+        );
+        let whole = rendered.samples.clone();
+
+        let cut = occurrence_start_frame(&twice, 1, 44_100);
+        assert_eq!(cut, pass_frames);
+        rendered.trim_start(cut);
+        assert_eq!(
+            rendered.samples.len() as u64,
+            (pass_frames + tail_frames) * 2
+        );
+        assert_eq!(rendered.samples[..], whole[cut as usize * 2..]);
+        assert!((rendered.seconds - section.seconds()).abs() < 1e-6);
+
+        // Nothing here is generative, so the kept pass differs from a lone
+        // pass only by what the first one left ringing into it.
+        let once = render(
+            &piece.isolate(verse, 1),
+            &InstrumentRegistry::built_in(),
+            44_100,
+        )
+        .expect("render");
+        assert_eq!(once.samples.len(), rendered.samples.len());
+        let opening = 4_410 * 2;
+        let carried = rendered.samples[..opening]
+            .iter()
+            .zip(&once.samples[..opening])
+            .fold(0.0f32, |most, (a, b)| most.max((a - b).abs()));
+        assert!(carried > 1e-4, "the first pass left nothing ringing");
     }
 
     #[test]

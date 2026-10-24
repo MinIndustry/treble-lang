@@ -28,6 +28,10 @@ RENDER OPTIONS:
     -m, --meta <k=v>     Add or override a metadata tag. Repeatable.
     -s, --section <name> Render only this section, starting on the cycle it
                          first plays on, so it sounds as it does in the song.
+    -p, --passes <n>     With --section: play it n times back to back and keep
+                         only the last pass and its tail — a loop whose start
+                         carries what the pass before it left ringing.
+                         Default 1.
     -f, --force          Overwrite the output if it exists.
     -q, --quiet          Only report errors.
         --json           Emit a machine-readable summary on stdout.
@@ -318,13 +322,14 @@ fn cmd_render(_args: &[String]) -> Result<(), String> {
 fn cmd_render(args: &[String]) -> Result<(), String> {
     use std::io::Write;
     use std::path::PathBuf;
-    use treble_lang::render::{Progress, render_with_progress, wav};
+    use treble_lang::render::{Progress, occurrence_start_frame, render_with_progress, wav};
 
     let mut input: Option<String> = None;
     let mut out: Option<PathBuf> = None;
     let mut rate: u32 = 44_100;
     let mut extra: Vec<(String, String)> = Vec::new();
     let mut section: Option<String> = None;
+    let mut passes: u32 = 1;
     let (mut force, mut quiet, mut json) = (false, false, false);
 
     let mut i = 0;
@@ -355,6 +360,12 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                 extra.push((key.to_ascii_lowercase(), text.to_string()));
             }
             "-s" | "--section" => section = Some(take("--section")?),
+            "-p" | "--passes" => {
+                let value = take("--passes")?;
+                passes = value.parse().ok().filter(|&n| n >= 1).ok_or_else(|| {
+                    format!("--passes: expected a count of 1 or more, got '{value}'")
+                })?;
+            }
             "-f" | "--force" => force = true,
             "-q" | "--quiet" => quiet = true,
             "--json" => json = true,
@@ -366,6 +377,9 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
+    if passes > 1 && section.is_none() {
+        return Err("--passes repeats one section, so it needs --section".into());
+    }
     let input = input.ok_or("render: expected a file")?;
     let source = read(&input)?;
     let out = out.unwrap_or_else(|| Path::new(&input).with_extension("wav"));
@@ -420,7 +434,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     // against the piece's opening tempo, not the tempo of the part rendered.
     if let Some(name) = &section {
         let index = section_named(&piece, name, &input)?;
-        piece = piece.isolate(index);
+        piece = piece.isolate(index, passes);
     }
 
     if !quiet {
@@ -462,20 +476,38 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         }
     };
 
-    let rendered = render_with_progress(&piece, &registry, rate, &mut report)?;
+    let mut rendered = render_with_progress(&piece, &registry, rate, &mut report)?;
     if !quiet {
         eprint!("\r\x1b[2K");
+    }
+    // Only the last pass is kept. The earlier ones exist so the file opens on
+    // the reverb and delay the section leaves ringing when it follows itself —
+    // a loop played back to back in a game — instead of on silence. The cut is
+    // made on the frame the last pass was scheduled from, so the file is
+    // exactly one pass plus the tail, with no rounding at either end. How much
+    // carries in is the tail: each pass rings on for `tail` past its end, so
+    // with `tail 0` the earlier passes leave nothing behind.
+    if passes > 1 {
+        rendered.trim_start(occurrence_start_frame(
+            &piece,
+            piece.timeline.len() - 1,
+            rate,
+        ));
     }
     wav::write(&out, &rendered, &piece, force)?;
     let elapsed = started.elapsed().as_secs_f64();
 
     if json {
         println!(
-            "{{\"path\":{:?},\"seconds\":{:.3},\"renderedSeconds\":{:.3},\"sampleRate\":{},\
+            "{{\"path\":{:?},\"section\":{},\"passes\":{},\"seconds\":{:.3},\"renderedSeconds\":{:.3},\"sampleRate\":{},\
              \"sections\":{},\"occurrences\":{},\"cycles\":{},\"notes\":{},\"elapsed\":{:.3},\
              \"islands\":{},\"slots\":{},\"workers\":{},\"preLimiterPeak\":{:.6},\
              \"postLimiterPeak\":{:.6},\"maxGainReductionDb\":{:.3},\"limitedSamples\":{}}}",
             out.display().to_string(),
+            section
+                .as_ref()
+                .map_or("null".to_string(), |name| format!("{name:?}")),
+            passes,
             rendered.seconds,
             rendered.rendered_seconds,
             rendered.sample_rate,
@@ -596,6 +628,22 @@ mod render_option_tests {
         section intro 2 {\n  k kick \"x\"\n}\n\
         section verse 4 {\n  lead sine \"c4 e4\"\n}\n\
         arrange intro verse\n";
+
+    #[test]
+    fn passes_without_a_section_are_refused_before_anything_is_read() {
+        let args: Vec<String> = ["missing.rt", "--passes", "2"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let error = cmd_render(&args).expect_err("--passes needs --section");
+        assert!(error.contains("needs --section"), "{error}");
+        let zero: Vec<String> = ["missing.rt", "--passes", "0"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let error = cmd_render(&zero).expect_err("zero passes");
+        assert!(error.contains("1 or more"), "{error}");
+    }
 
     #[test]
     fn an_unknown_section_is_refused_with_the_names_there_are() {
