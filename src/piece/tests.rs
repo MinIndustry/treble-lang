@@ -612,3 +612,46 @@ fn metadata_is_inert_in_a_live_buffer() {
     // It changes no sound, so it produces no delta beyond the pattern itself.
     assert_eq!(result.deltas.len(), 1);
 }
+
+// --- Isolating a section ---
+
+#[test]
+fn an_isolated_section_starts_where_the_song_first_plays_it() {
+    let full = piece(
+        "bpm 120\nsection intro 2 {\n  a kick \"x\"\n}\n\
+         section verse 4 {\n  bpm 90\n  b kick \"x\"\n}\n\
+         drone sine \"c2\"\n\
+         arrange intro*3 verse intro verse\n",
+    );
+    let verse = full.section_index("verse").expect("verse");
+    assert_eq!(full.first_playing(verse), 6);
+
+    let alone = full.isolate(verse);
+    assert_eq!(alone.sections.len(), 1);
+    assert_eq!(alone.sections[0].name, "verse");
+    assert_eq!(
+        alone.timeline,
+        vec![super::Occurrence {
+            section: 0,
+            start_cycle: 6
+        }]
+    );
+    assert_eq!(alone.total_cycles(), 4);
+    assert!((alone.seconds() - full.sections[verse].seconds()).abs() < 1e-9);
+    assert_eq!(
+        alone.throughout.len(),
+        1,
+        "a line outside sections still sounds"
+    );
+    assert!(alone.unused.is_empty(), "the dropped sections are not news");
+}
+
+#[test]
+fn a_section_never_played_is_isolated_from_cycle_0() {
+    let full = piece(
+        "section a 2 {\n  x kick \"x\"\n}\nsection sketch 2 {\n  y kick \"x\"\n}\narrange a a\n",
+    );
+    let sketch = full.section_index("sketch").expect("sketch");
+    assert_eq!(full.isolate(sketch).timeline[0].start_cycle, 0);
+    assert_eq!(full.section_index("chorus"), None);
+}

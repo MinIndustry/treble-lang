@@ -133,6 +133,57 @@ impl Piece {
         self.seconds() + self.tail
     }
 
+    /// The index into [`Piece::sections`] of the section called `name`.
+    pub fn section_index(&self, name: &str) -> Option<usize> {
+        self.sections
+            .iter()
+            .position(|section| section.name == name)
+    }
+
+    /// The absolute cycle a section first starts on, or 0 when it never plays.
+    ///
+    /// This is where a section is taken from whenever it is looked at on its
+    /// own — drawn by an editor or rendered by itself — because its generative
+    /// steps count from there.
+    pub fn first_playing(&self, section: usize) -> u64 {
+        self.timeline
+            .iter()
+            .find(|occurrence| occurrence.section == section)
+            .map_or(0, |occurrence| occurrence.start_cycle)
+    }
+
+    /// This piece cut down to one section, heard where the song first plays it.
+    ///
+    /// The occurrence keeps the section's absolute starting cycle rather than
+    /// starting from 0: choices, drops and solos count from an occurrence's
+    /// place in the piece (§3.12, §3.15, §3.19, §8.8), so a section rendered as
+    /// a fresh piece would not sound the way it does in the song. The rule is
+    /// the editor's — a section never played is taken from cycle 0.
+    ///
+    /// Lines outside every section still sound under it, as they do in the
+    /// song, and the metadata travels so a render of the part is still filed
+    /// under the piece. Every other section is dropped, so nothing is reported
+    /// as never played.
+    pub fn isolate(&self, section: usize) -> Piece {
+        let kept = self.sections[section].clone();
+        Piece {
+            arrangement: vec![ArrangeItem {
+                section: kept.name.clone(),
+                repeat: 1,
+            }],
+            timeline: vec![Occurrence {
+                section: 0,
+                start_cycle: self.first_playing(section),
+            }],
+            sections: vec![kept],
+            throughout: self.throughout.clone(),
+            tail: self.tail,
+            seed: self.seed,
+            unused: Vec::new(),
+            metadata: self.metadata.clone(),
+        }
+    }
+
     /// Walk the timeline, yielding each occurrence with its section and the
     /// second it starts at.
     ///

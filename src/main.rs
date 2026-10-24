@@ -26,6 +26,8 @@ RENDER OPTIONS:
     -o, --out <path>     Output file. Defaults to the input with a .wav suffix.
     -r, --rate <hz>      Sample rate. Default 44100.
     -m, --meta <k=v>     Add or override a metadata tag. Repeatable.
+    -s, --section <name> Render only this section, starting on the cycle it
+                         first plays on, so it sounds as it does in the song.
     -f, --force          Overwrite the output if it exists.
     -q, --quiet          Only report errors.
         --json           Emit a machine-readable summary on stdout.
@@ -322,6 +324,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     let mut out: Option<PathBuf> = None;
     let mut rate: u32 = 44_100;
     let mut extra: Vec<(String, String)> = Vec::new();
+    let mut section: Option<String> = None;
     let (mut force, mut quiet, mut json) = (false, false, false);
 
     let mut i = 0;
@@ -351,6 +354,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                     .ok_or_else(|| format!("--meta: expected key=value, got '{value}'"))?;
                 extra.push((key.to_ascii_lowercase(), text.to_string()));
             }
+            "-s" | "--section" => section = Some(take("--section")?),
             "-f" | "--force" => force = true,
             "-q" | "--quiet" => quiet = true,
             "--json" => json = true,
@@ -410,6 +414,13 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         registry
             .register(spec)
             .map_err(|error| format!("def {}: {error}", definition.name))?;
+    }
+
+    // Cut down after the registry is built: a definition's rates resolve
+    // against the piece's opening tempo, not the tempo of the part rendered.
+    if let Some(name) = &section {
+        let index = section_named(&piece, name, &input)?;
+        piece = piece.isolate(index);
     }
 
     if !quiet {
@@ -507,6 +518,19 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The index of the section `--section` asked for, or an error naming the
+/// sections there are, so a typo is caught rather than rendered as silence.
+#[cfg(feature = "render")]
+fn section_named(piece: &treble_lang::Piece, name: &str, input: &str) -> Result<usize, String> {
+    piece.section_index(name).ok_or_else(|| {
+        let names: Vec<&str> = piece.sections.iter().map(|s| s.name.as_str()).collect();
+        format!(
+            "--section: '{name}' is not a section in {input} — it has {}",
+            names.join(", ")
+        )
+    })
+}
+
 /// A 24-cell progress bar. Written with block characters so it reads at a
 /// glance without needing a terminal library.
 #[cfg(feature = "render")]
@@ -554,5 +578,31 @@ mod load_resolution_tests {
         assert!(error.contains("def` blocks only"), "{error}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(all(test, feature = "render"))]
+mod render_option_tests {
+    use super::*;
+
+    fn piece_of(source: &str) -> treble_lang::Piece {
+        let mut session = treble_lang::Session::new();
+        let result = session.evaluate(source);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        session.piece().expect("a piece").clone()
+    }
+
+    const TWO_SECTIONS: &str = "bpm 120\n\
+        section intro 2 {\n  k kick \"x\"\n}\n\
+        section verse 4 {\n  lead sine \"c4 e4\"\n}\n\
+        arrange intro verse\n";
+
+    #[test]
+    fn an_unknown_section_is_refused_with_the_names_there_are() {
+        let piece = piece_of(TWO_SECTIONS);
+        assert_eq!(section_named(&piece, "verse", "p.rt"), Ok(1));
+        let error = section_named(&piece, "chorus", "p.rt").expect_err("no chorus");
+        assert!(error.contains("'chorus'"), "{error}");
+        assert!(error.contains("intro, verse"), "{error}");
     }
 }

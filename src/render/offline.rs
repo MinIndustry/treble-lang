@@ -793,6 +793,51 @@ mod tests {
         );
     }
 
+    /// A section rendered on its own sounds the way it does in the song: its
+    /// drops and choices count from where the arrangement first plays it, not
+    /// from cycle 0, so the notes are the song's, shifted to the start. Its
+    /// alternations count from its own first bar either way (§8.6).
+    #[test]
+    fn an_isolated_section_schedules_the_songs_notes() {
+        let source = "bpm 120\ntail 0\n\
+             section intro 3 {\n  k kick \"x\"\n}\n\
+             section verse 4 {\n  lead sine \"[c4|e4|g4|b4] d5? [a3|f3] g5?\"\n\
+             \x20 chords sine \"<c3 e3 g3 a3>\"\n}\n\
+             arrange intro verse\n";
+        let (program, errors) = crate::parser::parse_program(source);
+        assert!(errors.is_empty(), "parse: {errors:?}");
+        let (piece, errors) = crate::piece::resolve(&program, (120, (4, 4), None));
+        assert!(errors.is_empty(), "resolve: {errors:?}");
+        let registry = InstrumentRegistry::built_in();
+        let verse = piece.section_index("verse").expect("verse");
+
+        let offset = 3 * section_cycle_frames(&piece.sections[0], 44_100);
+        let in_song: Vec<(u64, u8)> = scheduled_notes(&piece, &registry, 44_100)
+            .expect("notes")
+            .into_iter()
+            .filter(|note| note.section == "verse")
+            .map(|note| (note.start - offset, note.midi))
+            .collect();
+        let alone: Vec<(u64, u8)> = scheduled_notes(&piece.isolate(verse), &registry, 44_100)
+            .expect("notes")
+            .into_iter()
+            .map(|note| (note.start, note.midi))
+            .collect();
+        assert!(!alone.is_empty());
+        assert_eq!(alone, in_song);
+
+        // The same section from cycle 0 is a different take — which is the
+        // whole reason the occurrence keeps its place.
+        let mut from_zero = piece.isolate(verse);
+        from_zero.timeline[0].start_cycle = 0;
+        let fresh: Vec<(u64, u8)> = scheduled_notes(&from_zero, &registry, 44_100)
+            .expect("notes")
+            .into_iter()
+            .map(|note| (note.start, note.midi))
+            .collect();
+        assert_ne!(fresh, in_song, "the choices did not depend on the cycle");
+    }
+
     #[test]
     fn the_arrangement_orders_what_is_heard() {
         let piece = rendered(
@@ -1033,12 +1078,12 @@ pub fn section_strikes(
 }
 
 /// The absolute cycle a section first starts on, or 0 when it never plays.
+///
+/// The rule lives on [`Piece::first_playing`], so a caller without the
+/// renderer can read it too; this is kept beside [`section_strikes`], which
+/// it serves.
 pub fn first_playing(piece: &Piece, section: usize) -> u64 {
-    piece
-        .timeline
-        .iter()
-        .find(|occurrence| occurrence.section == section)
-        .map_or(0, |occurrence| occurrence.start_cycle)
+    piece.first_playing(section)
 }
 
 /// One line's strikes over its section, each with the 0-based cycle within
