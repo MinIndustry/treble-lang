@@ -107,7 +107,7 @@ rendered piece carries its own title rather than relying on the filename:
 
 ```
 meta title    "Nocturne for a Slow Machine"
-meta composer "F. Grimau"
+meta composer "Minigrim0"
 meta comment  "One collection, three centres."
 ```
 
