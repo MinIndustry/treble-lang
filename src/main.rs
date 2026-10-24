@@ -12,7 +12,7 @@ treble — the Treble language toolchain
 
 USAGE:
     treble check <file.rt>
-    treble info  <file.rt>
+    treble info  <file.rt> [--json [--bars]]
     treble render <file.rt> [-o <out.wav>] [options]
     treble serve
 
@@ -22,10 +22,31 @@ COMMANDS:
     render    Render a piece to a WAV file.
     serve     Speak LSP on stdin/stdout, with a player, for an editor.
 
+INFO OPTIONS:
+        --json           Print the structure as JSON on stdout: metadata, tail,
+                         seed, arrangement, timeline, and per section its
+                         timing, first cycle, occurrences and lines.
+        --bars           With --json: give each line of a section the bars it
+                         strikes on, as the section first plays. Needs the
+                         renderer.
+
 RENDER OPTIONS:
     -o, --out <path>     Output file. Defaults to the input with a .wav suffix.
     -r, --rate <hz>      Sample rate. Default 44100.
     -m, --meta <k=v>     Add or override a metadata tag. Repeatable.
+    -s, --section <name> Render only this section, starting on the cycle it
+                         first plays on, so it sounds as it does in the song.
+    -p, --passes <n>     With --section: play it n times back to back and keep
+                         only the last pass and its tail — a loop whose start
+                         carries what the pass before it left ringing.
+                         Default 1.
+    -t, --tail <seconds> Ring out this long past the last cycle instead of the
+                         piece's own `tail` (§8.7).
+        --only <a,b>     Mute every line whose instrument is not listed. An
+                         instrument no rendered line plays is an error.
+        --no-limit       Skip the master limiter, so renders of parts add up
+                         to the render of the whole. Peaks may pass 1.0; the
+                         WAV is 32-bit float, so they are kept, not clipped.
     -f, --force          Overwrite the output if it exists.
     -q, --quiet          Only report errors.
         --json           Emit a machine-readable summary on stdout.
@@ -123,9 +144,29 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Print the structure the score editor draws, for a terminal.
+/// Print the structure the score editor draws, for a terminal or, with
+/// `--json`, for a build script.
 fn cmd_info(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or("info: expected a file")?;
+    let mut path: Option<&str> = None;
+    let mut json = false;
+    let mut bars = false;
+    let mut only_positional = false;
+    for arg in args {
+        match arg.as_str() {
+            other if only_positional => path = Some(other),
+            "--" => only_positional = true,
+            "--json" => json = true,
+            "--bars" => bars = true,
+            other if other.starts_with('-') => {
+                return Err(format!("info: unknown option '{other}'"));
+            }
+            other => path = Some(other),
+        }
+    }
+    if bars && !json {
+        return Err("--bars adds to the JSON, so it needs --json".into());
+    }
+    let path = path.ok_or("info: expected a file")?;
     let source = read(path)?;
     let mut session = treble_lang::Session::new();
     let result = session.evaluate(&source);
@@ -135,6 +176,20 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
     let piece = session
         .piece()
         .ok_or("that buffer has no sections, so there is no piece to describe")?;
+
+    if json {
+        let bars = if bars {
+            Some(struck_bars(&session, piece, path)?)
+        } else {
+            None
+        };
+        let described = describe(piece, path, bars.as_deref());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&described).map_err(|error| error.to_string())?
+        );
+        return Ok(());
+    }
 
     if !piece.metadata.is_empty() {
         for (key, value) in &piece.metadata {
@@ -189,6 +244,157 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
         println!("\n  never played: {}", piece.unused.join(", "));
     }
     Ok(())
+}
+
+/// A piece's structure as JSON, for a build script that cuts it up.
+///
+/// Read off the resolved [`Piece`], so a script never has to parse the source
+/// or scrape the text `info` prints. Times are in seconds and cycles count
+/// from 0 at the start of the piece, as on the timeline; a span is the 1-based
+/// bars of its section it sounds on, inclusive (§8.3). The keys are camelCase,
+/// like `render --json`.
+///
+/// With `bars` — per section, each line's name and whether it strikes on each
+/// bar — every section line also carries `bars`.
+fn describe(
+    piece: &treble_lang::Piece,
+    path: &str,
+    bars: Option<&[SectionBars]>,
+) -> serde_json::Value {
+    use serde_json::{Map, Value, json};
+
+    let line = |line: &treble_lang::PatternDef, cycles: Option<u32>| {
+        json!({
+            "name": line.name,
+            "instrument": line.instrument,
+            "group": line.group,
+            "muted": line.muted,
+            "span": match (line.span, cycles) {
+                (Some(span), Some(cycles)) => json!({
+                    "from": span.start(),
+                    "to": span.end(cycles).min(cycles),
+                }),
+                _ => Value::Null,
+            },
+        })
+    };
+    let metadata: Map<String, Value> = piece
+        .metadata
+        .iter()
+        .map(|(key, value)| (key.clone(), Value::from(value.as_str())))
+        .collect();
+    let sections: Vec<Value> = piece
+        .sections
+        .iter()
+        .enumerate()
+        .map(|(index, section)| {
+            let occurrences = piece.timeline.iter().filter(|o| o.section == index).count();
+            json!({
+                "name": section.name,
+                "muted": section.muted,
+                "cycles": section.cycles,
+                "bpm": section.bpm,
+                "sig": [section.sig.0, section.sig.1],
+                "seconds": section.seconds(),
+                "cycleSeconds": section.cycle_seconds(),
+                "firstCycle": piece.first_playing(index),
+                "occurrences": occurrences,
+                "groups": section.groups.iter().map(|group| json!({
+                    "name": group.name,
+                    "muted": group.muted,
+                })).collect::<Vec<_>>(),
+                "lines": section.patterns.iter()
+                    .map(|member| {
+                        let mut described = line(member, Some(section.cycles));
+                        if let Some(struck) = bars
+                            .and_then(|bars| bars.get(index))
+                            .and_then(|lines| lines.iter().find(|(name, _)| *name == member.name))
+                        {
+                            described["bars"] = json!(struck.1);
+                        }
+                        described
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let timeline: Vec<Value> = piece
+        .walk()
+        .map(|placed| {
+            json!({
+                "section": placed.section.name,
+                "startCycle": placed.start_cycle,
+                "startSeconds": placed.start_seconds,
+            })
+        })
+        .collect();
+
+    json!({
+        "path": path,
+        "title": piece.meta("title"),
+        "metadata": metadata,
+        "tail": piece.tail,
+        "seed": piece.seed,
+        "cycles": piece.total_cycles(),
+        "seconds": piece.seconds(),
+        "renderSeconds": piece.render_seconds(),
+        "arrangement": piece.arrangement.iter().map(|item| json!({
+            "section": item.section,
+            "repeat": item.repeat,
+        })).collect::<Vec<_>>(),
+        "timeline": timeline,
+        "sections": sections,
+        "throughout": piece.throughout.iter()
+            .map(|member| line(member, None))
+            .collect::<Vec<_>>(),
+        "unused": piece.unused,
+    })
+}
+
+/// One section's lines, each with whether it strikes on each of the section's
+/// bars.
+type SectionBars = Vec<(String, Vec<bool>)>;
+
+/// Which bars each line of each section strikes on.
+///
+/// Read off [`section_strikes`](treble_lang::render::section_strikes), so a
+/// section is taken as it first plays — its drops and choices are the song's
+/// — and a muted line still says where it would strike. A bar a line's span
+/// excludes, or that its drops empty, is `false`.
+#[cfg(feature = "render")]
+fn struck_bars(
+    session: &treble_lang::Session,
+    piece: &treble_lang::Piece,
+    path: &str,
+) -> Result<Vec<SectionBars>, String> {
+    let registry = instrument_registry(session, piece, path)?;
+    (0..piece.sections.len())
+        .map(|index| {
+            let cycles = piece.sections[index].cycles as usize;
+            let lanes = treble_lang::render::section_strikes(piece, &registry, index, None)?;
+            Ok(lanes
+                .into_iter()
+                .map(|lane| {
+                    let mut bars = vec![false; cycles];
+                    for (cycle, _) in &lane.strikes {
+                        if let Some(bar) = bars.get_mut(*cycle as usize) {
+                            *bar = true;
+                        }
+                    }
+                    (lane.line, bars)
+                })
+                .collect())
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "render"))]
+fn struck_bars(
+    _session: &treble_lang::Session,
+    _piece: &treble_lang::Piece,
+    _path: &str,
+) -> Result<Vec<SectionBars>, String> {
+    Err("--bars reads the strikes the renderer schedules — rebuild with `--features render`".into())
 }
 
 /// Resolve the buffer's `load` lines into instrument definitions (§2.5).
@@ -316,12 +522,19 @@ fn cmd_render(_args: &[String]) -> Result<(), String> {
 fn cmd_render(args: &[String]) -> Result<(), String> {
     use std::io::Write;
     use std::path::PathBuf;
-    use treble_lang::render::{Progress, render_with_progress, wav};
+    use treble_lang::render::{
+        Progress, RenderOptions, occurrence_start_frame, render_with_options, wav,
+    };
 
     let mut input: Option<String> = None;
     let mut out: Option<PathBuf> = None;
     let mut rate: u32 = 44_100;
     let mut extra: Vec<(String, String)> = Vec::new();
+    let mut section: Option<String> = None;
+    let mut passes: u32 = 1;
+    let mut only: Vec<String> = Vec::new();
+    let mut tail: Option<f64> = None;
+    let mut limit = true;
     let (mut force, mut quiet, mut json) = (false, false, false);
 
     let mut i = 0;
@@ -351,6 +564,39 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                     .ok_or_else(|| format!("--meta: expected key=value, got '{value}'"))?;
                 extra.push((key.to_ascii_lowercase(), text.to_string()));
             }
+            "-s" | "--section" => section = Some(take("--section")?),
+            "-p" | "--passes" => {
+                let value = take("--passes")?;
+                passes = value.parse().ok().filter(|&n| n >= 1).ok_or_else(|| {
+                    format!("--passes: expected a count of 1 or more, got '{value}'")
+                })?;
+            }
+            "-t" | "--tail" => {
+                let value = take("--tail")?;
+                tail = Some(
+                    value
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                        .ok_or_else(|| {
+                            format!("--tail: expected seconds, 0 or more, got '{value}'")
+                        })?,
+                );
+            }
+            "--only" => {
+                let value = take("--only")?;
+                only.extend(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string),
+                );
+                if only.is_empty() {
+                    return Err("--only: expected one or more instruments".into());
+                }
+            }
+            "--no-limit" => limit = false,
             "-f" | "--force" => force = true,
             "-q" | "--quiet" => quiet = true,
             "--json" => json = true,
@@ -362,6 +608,9 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
+    if passes > 1 && section.is_none() {
+        return Err("--passes repeats one section, so it needs --section".into());
+    }
     let input = input.ok_or("render: expected a file")?;
     let source = read(&input)?;
     let out = out.unwrap_or_else(|| Path::new(&input).with_extension("wav"));
@@ -389,27 +638,21 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
 
     // `def` blocks in the buffer are lowered into the registry the renderer
     // reads, so a piece can carry its own instruments.
-    let mut registry = treble::instruments::prelude::InstrumentRegistry::built_in();
-    // A definition's own cycle-relative rates resolve against the opening
-    // tempo. Sections may differ, but an instrument is defined once for the
-    // whole piece, so there is one cycle length to read it against.
-    let cycle = piece
-        .sections
-        .first()
-        .map_or(2.0, |section| section.cycle_seconds());
-    for definition in &loaded_definitions(&session, Path::new(&input))? {
-        let spec = treble_lang::render::compile::lower_instrument_def(definition, cycle)
-            .map_err(|error| format!("def {}: {error}", definition.name))?;
-        registry
-            .register(spec)
-            .map_err(|error| format!("def {}: {error}", definition.name))?;
+    let registry = instrument_registry(&session, &piece, &input)?;
+
+    // Cut down after the registry is built: a definition's rates resolve
+    // against the piece's opening tempo, not the tempo of the part rendered.
+    if let Some(name) = &section {
+        let index = section_named(&piece, name, &input)?;
+        piece = piece.isolate(index, passes);
     }
-    for definition in session.definitions().values() {
-        let spec = treble_lang::render::compile::lower_instrument_def(definition, cycle)
-            .map_err(|error| format!("def {}: {error}", definition.name))?;
-        registry
-            .register(spec)
-            .map_err(|error| format!("def {}: {error}", definition.name))?;
+    if !only.is_empty() {
+        keep_only(&mut piece, &only)?;
+    }
+    // Like `-m`, the command line wins over the file: a loop for a game wants
+    // its tail decided by the build, not by how the piece ends.
+    if let Some(seconds) = tail {
+        piece.tail = seconds;
     }
 
     if !quiet {
@@ -451,20 +694,42 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         }
     };
 
-    let rendered = render_with_progress(&piece, &registry, rate, &mut report)?;
+    let options = RenderOptions {
+        master_limiter: limit,
+    };
+    let mut rendered = render_with_options(&piece, &registry, rate, options, &mut report)?;
     if !quiet {
         eprint!("\r\x1b[2K");
+    }
+    // Only the last pass is kept. The earlier ones exist so the file opens on
+    // the reverb and delay the section leaves ringing when it follows itself —
+    // a loop played back to back in a game — instead of on silence. The cut is
+    // made on the frame the last pass was scheduled from, so the file is
+    // exactly one pass plus the tail, with no rounding at either end. How much
+    // carries in is the tail: each pass rings on for `tail` past its end, so
+    // with `tail 0` the earlier passes leave nothing behind.
+    if passes > 1 {
+        rendered.trim_start(occurrence_start_frame(
+            &piece,
+            piece.timeline.len() - 1,
+            rate,
+        ));
     }
     wav::write(&out, &rendered, &piece, force)?;
     let elapsed = started.elapsed().as_secs_f64();
 
     if json {
         println!(
-            "{{\"path\":{:?},\"seconds\":{:.3},\"renderedSeconds\":{:.3},\"sampleRate\":{},\
+            "{{\"path\":{:?},\"section\":{},\"passes\":{},\"seconds\":{:.3},\"renderedSeconds\":{:.3},\"sampleRate\":{},\
              \"sections\":{},\"occurrences\":{},\"cycles\":{},\"notes\":{},\"elapsed\":{:.3},\
              \"islands\":{},\"slots\":{},\"workers\":{},\"preLimiterPeak\":{:.6},\
-             \"postLimiterPeak\":{:.6},\"maxGainReductionDb\":{:.3},\"limitedSamples\":{}}}",
+             \"postLimiterPeak\":{:.6},\"maxGainReductionDb\":{:.3},\"limitedSamples\":{},\
+             \"limited\":{},\"peak\":{:.6}}}",
             out.display().to_string(),
+            section
+                .as_ref()
+                .map_or("null".to_string(), |name| format!("{name:?}")),
+            passes,
             rendered.seconds,
             rendered.rendered_seconds,
             rendered.sample_rate,
@@ -479,7 +744,9 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
             rendered.telemetry.pre_limiter_peak,
             rendered.telemetry.post_limiter_peak,
             rendered.telemetry.max_gain_reduction_db,
-            rendered.telemetry.limited_samples
+            rendered.telemetry.limited_samples,
+            rendered.limited,
+            rendered.peak()
         );
     } else if !quiet {
         eprintln!(
@@ -500,10 +767,83 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                 rendered.telemetry.limited_samples
             );
         }
+        if !rendered.limited && rendered.peak() > 1.0 {
+            eprintln!(
+                "  note: unlimited, peaks at {:.3} — kept in the float WAV, but mix it \
+                 down before converting it to integer PCM",
+                rendered.peak()
+            );
+        }
         for name in &rendered.unused {
             eprintln!("  note: section '{name}' is never played");
         }
     }
+    Ok(())
+}
+
+/// The built-in instruments plus the buffer's `def` blocks and whatever its
+/// `load` lines bring in, lowered onto the engine.
+#[cfg(feature = "render")]
+fn instrument_registry(
+    session: &treble_lang::Session,
+    piece: &treble_lang::Piece,
+    input: &str,
+) -> Result<treble::instruments::prelude::InstrumentRegistry, String> {
+    let mut registry = treble::instruments::prelude::InstrumentRegistry::built_in();
+    // A definition's own cycle-relative rates resolve against the opening
+    // tempo. Sections may differ, but an instrument is defined once for the
+    // whole piece, so there is one cycle length to read it against.
+    let cycle = piece
+        .sections
+        .first()
+        .map_or(2.0, |section| section.cycle_seconds());
+    let loaded = loaded_definitions(session, Path::new(input))?;
+    for definition in loaded.iter().chain(session.definitions().values()) {
+        let spec = treble_lang::render::compile::lower_instrument_def(definition, cycle)
+            .map_err(|error| format!("def {}: {error}", definition.name))?;
+        registry
+            .register(spec)
+            .map_err(|error| format!("def {}: {error}", definition.name))?;
+    }
+    Ok(registry)
+}
+
+/// The index of the section `--section` asked for, or an error naming the
+/// sections there are, so a typo is caught rather than rendered as silence.
+#[cfg(feature = "render")]
+fn section_named(piece: &treble_lang::Piece, name: &str, input: &str) -> Result<usize, String> {
+    piece.section_index(name).ok_or_else(|| {
+        let names: Vec<&str> = piece.sections.iter().map(|s| s.name.as_str()).collect();
+        format!(
+            "--section: '{name}' is not a section in {input} — it has {}",
+            names.join(", ")
+        )
+    })
+}
+
+/// Mute every line not played on one of `instruments`, refusing a name that
+/// no line of the rendered sections plays.
+///
+/// A typo in a build script would otherwise write a file of silence that looks
+/// like a successful render; the caller owns the mapping from its own groups
+/// to instruments, so it is the caller who has to hear about a stale one.
+#[cfg(feature = "render")]
+fn keep_only(piece: &mut treble_lang::Piece, instruments: &[String]) -> Result<(), String> {
+    let played = piece.played_instruments();
+    let missing: Vec<&str> = instruments
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !played.contains(name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "--only: no line plays {} here — the lines play {}",
+            missing.join(", "),
+            played.join(", ")
+        ));
+    }
+    let keep: Vec<&str> = instruments.iter().map(String::as_str).collect();
+    piece.mute_except(&keep);
     Ok(())
 }
 
@@ -554,5 +894,164 @@ mod load_resolution_tests {
         assert!(error.contains("def` blocks only"), "{error}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(all(test, feature = "render"))]
+mod render_option_tests {
+    use super::*;
+
+    fn piece_of(source: &str) -> treble_lang::Piece {
+        let mut session = treble_lang::Session::new();
+        let result = session.evaluate(source);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        session.piece().expect("a piece").clone()
+    }
+
+    const TWO_SECTIONS: &str = "bpm 120\n\
+        section intro 2 {\n  k kick \"x\"\n}\n\
+        section verse 4 {\n  lead sine \"c4 e4\"\n}\n\
+        arrange intro verse\n";
+
+    #[test]
+    fn passes_without_a_section_are_refused_before_anything_is_read() {
+        let args: Vec<String> = ["missing.rt", "--passes", "2"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let error = cmd_render(&args).expect_err("--passes needs --section");
+        assert!(error.contains("needs --section"), "{error}");
+        let zero: Vec<String> = ["missing.rt", "--passes", "0"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let error = cmd_render(&zero).expect_err("zero passes");
+        assert!(error.contains("1 or more"), "{error}");
+    }
+
+    #[test]
+    fn only_mutes_the_other_instruments_and_refuses_a_stranger() {
+        let mut piece = piece_of(
+            "bpm 120\nsection a 2 {\n  k kick \"x\"\n  b bass \"c2\"\n}\n\
+             section sketch 1 {\n  p pad \"c3\"\n}\n\
+             hum sine \"c1\"\n\
+             arrange a\n",
+        );
+        let error =
+            keep_only(&mut piece.clone(), &["bass".into(), "basss".into()]).expect_err("a typo");
+        assert!(error.contains("basss"), "{error}");
+        assert!(error.contains("bass, kick, sine"), "{error}");
+        // `sketch` is never played, so its pad is not on offer.
+        assert!(keep_only(&mut piece.clone(), &["pad".into()]).is_err());
+
+        keep_only(&mut piece, &["bass".into(), "sine".into()]).expect("both play");
+        let muted: Vec<(&str, bool)> = piece.sections[0]
+            .patterns
+            .iter()
+            .chain(&piece.throughout)
+            .map(|line| (line.name.as_str(), line.muted))
+            .collect();
+        assert_eq!(muted, vec![("k", true), ("b", false), ("hum", false)]);
+    }
+
+    #[test]
+    fn a_tail_must_be_a_length() {
+        for bad in ["-1", "soon", "inf", "NaN"] {
+            let args: Vec<String> = ["missing.rt", "--tail", bad]
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect();
+            let error = cmd_render(&args).expect_err(bad);
+            assert!(error.contains("--tail"), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_section_is_refused_with_the_names_there_are() {
+        let piece = piece_of(TWO_SECTIONS);
+        assert_eq!(section_named(&piece, "verse", "p.rt"), Ok(1));
+        let error = section_named(&piece, "chorus", "p.rt").expect_err("no chorus");
+        assert!(error.contains("'chorus'"), "{error}");
+        assert!(error.contains("intro, verse"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod info_tests {
+    use super::*;
+
+    #[test]
+    fn the_json_describes_sections_where_they_first_play() {
+        let mut session = treble_lang::Session::new();
+        let result = session.evaluate(
+            "meta title \"Drift\"\nbpm 120\ntail 1.5\nseed 7\n\
+             section intro 2 {\n  k kick \"x\"\n}\n\
+             section verse 4 {\n  group keys {\n    e epiano \"c4\" @ 3..\n  } | reverb 0.2\n\
+             \x20 ; b bass \"c2\"\n}\n\
+             hum sine \"c1\"\n\
+             arrange intro*2 verse intro\n",
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let described = describe(session.piece().expect("a piece"), "p.rt", None);
+
+        assert_eq!(described["title"], "Drift");
+        assert_eq!(described["metadata"]["title"], "Drift");
+        assert_eq!(described["tail"], 1.5);
+        assert_eq!(described["seed"], 7);
+        assert_eq!(described["cycles"], 10);
+        assert_eq!(described["arrangement"][0]["repeat"], 2);
+        assert_eq!(described["timeline"][2]["section"], "verse");
+        assert_eq!(described["timeline"][2]["startCycle"], 4);
+        assert_eq!(described["timeline"][2]["startSeconds"], 8.0);
+
+        let verse = &described["sections"][1];
+        assert_eq!(verse["name"], "verse");
+        assert_eq!(verse["sig"], serde_json::json!([4, 4]));
+        assert_eq!(verse["cycleSeconds"], 2.0);
+        assert_eq!(verse["seconds"], 8.0);
+        assert_eq!(verse["firstCycle"], 4);
+        assert_eq!(verse["occurrences"], 1);
+        assert_eq!(described["sections"][0]["occurrences"], 3);
+        assert_eq!(
+            verse["lines"],
+            serde_json::json!([
+                {"name": "e", "instrument": "epiano", "group": "keys", "muted": false,
+                 "span": {"from": 3, "to": 4}},
+                {"name": "b", "instrument": "bass", "group": null, "muted": true, "span": null},
+            ])
+        );
+        assert_eq!(verse["groups"][0]["name"], "keys");
+        assert_eq!(described["throughout"][0]["instrument"], "sine");
+    }
+}
+
+#[cfg(all(test, feature = "render"))]
+mod bars_tests {
+    use super::*;
+
+    #[test]
+    fn each_line_says_which_bars_it_strikes_on() {
+        let mut session = treble_lang::Session::new();
+        let result = session.evaluate(
+            "bpm 120\nsection a 4 {\n  k kick \"x\"\n  late sine \"c4\" @ 3\n  \
+             gap sine \"<c4 ~ c4 ~>\"\n}\n",
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let piece = session.piece().expect("a piece");
+        let bars = struck_bars(&session, piece, "p.rt").expect("bars");
+        let described = describe(piece, "p.rt", Some(&bars));
+        let lines = &described["sections"][0]["lines"];
+        assert_eq!(
+            lines[0]["bars"],
+            serde_json::json!([true, true, true, true])
+        );
+        assert_eq!(
+            lines[1]["bars"],
+            serde_json::json!([false, false, true, false])
+        );
+        assert_eq!(
+            lines[2]["bars"],
+            serde_json::json!([true, false, true, false])
+        );
     }
 }

@@ -3,11 +3,15 @@ name = "treble-lang"
 description = "A live coding language for treble"
 license = "MIT"
 repository = "https://github.com/MinIndustry/treble-lang"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 
 [dependencies]
 nom = "8.0"
+# JSON for `info --json`, which has to work in a build without the renderer.
+# The library itself does not use it outside `serve`, and nothing derives:
+# the command line builds its JSON by hand, so no proc-macro comes along.
+serde_json = "1.0"
 
 # The language proper knows nothing about the engine, so both of these are
 # optional: parsing a buffer must not drag in a DSP stack. `render` turns on the
@@ -16,8 +20,8 @@ treble = { version = "0.4.3", optional = true }
 hound = { version = "3.5", optional = true }
 rayon = { version = "1.12", optional = true }
 # `serve` adds a language server and a player on top of the renderer: JSON for
-# the wire, and cpal for the sound card the renderer's samples are streamed to.
-serde_json = { version = "1.0", optional = true }
+# the wire (above), and cpal for the sound card the renderer's samples are
+# streamed to.
 cpal = { version = "0.15.3", optional = true }
 
 [dev-dependencies]
@@ -28,7 +32,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 default = []
 render = ["dep:treble", "dep:hound", "dep:rayon"]
 plotting = ["render", "treble/plotting"]
-serve = ["render", "dep:serde_json", "dep:cpal"]
+serve = ["render", "dep:cpal"]
 
 [[bench]]
 name = "offline"

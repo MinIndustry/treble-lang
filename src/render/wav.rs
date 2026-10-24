@@ -39,6 +39,12 @@ const INFO_TAGS: &[(&str, &str)] = &[
 ///
 /// Refuses to overwrite, like the app's own export: a render is cheap to redo
 /// and a take is not.
+///
+/// A limited render is clamped to full scale as a last guard. An unlimited one
+/// is written as it is: float samples carry levels above 1.0 without loss, and
+/// clamping them would clip each part where the sum of the parts would not —
+/// the very thing rendering unlimited is for. Such a file is meant to be mixed
+/// again, not converted to integer PCM as it stands.
 pub fn write(
     path: &Path,
     rendered: &RenderedPiece,
@@ -62,10 +68,13 @@ pub fn write(
         sample_format: hound::SampleFormat::Float,
     };
     let mut writer = hound::WavWriter::create(path, spec).map_err(|e| e.to_string())?;
-    for sample in &rendered.samples {
-        writer
-            .write_sample(sample.clamp(-1.0, 1.0))
-            .map_err(|e| e.to_string())?;
+    for &sample in &rendered.samples {
+        let sample = if rendered.limited {
+            sample.clamp(-1.0, 1.0)
+        } else {
+            sample
+        };
+        writer.write_sample(sample).map_err(|e| e.to_string())?;
     }
     writer.finalize().map_err(|e| e.to_string())?;
 
@@ -164,6 +173,7 @@ mod tests {
             notes: 12,
             unused: Vec::new(),
             telemetry: Default::default(),
+            limited: true,
         }
     }
 
@@ -230,6 +240,30 @@ mod tests {
             raw.windows(4).any(|w| w == needle),
             "no INAM tag in the written file"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Unlimited samples are written as they are; limited ones are clamped.
+    #[test]
+    fn only_a_limited_render_is_clamped_to_full_scale() {
+        let path = std::env::temp_dir().join(format!("treble-hot-{}.wav", std::process::id()));
+        let piece = piece_with(&[]);
+        let mut hot = rendered();
+        hot.samples = vec![1.5, -2.0, 0.5, -0.5];
+        let read = |path: &Path| -> Vec<f32> {
+            hound::WavReader::open(path)
+                .expect("readable")
+                .samples::<f32>()
+                .map(|s| s.unwrap())
+                .collect()
+        };
+
+        write(&path, &hot, &piece, true).expect("write");
+        assert_eq!(read(&path), vec![1.0, -1.0, 0.5, -0.5]);
+
+        hot.limited = false;
+        write(&path, &hot, &piece, true).expect("write");
+        assert_eq!(read(&path), vec![1.5, -2.0, 0.5, -0.5]);
         std::fs::remove_file(&path).ok();
     }
 

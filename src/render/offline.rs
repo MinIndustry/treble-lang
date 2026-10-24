@@ -65,6 +65,53 @@ pub struct RenderedPiece {
     pub unused: Vec<String>,
     /// Runtime and master-bus measurements from this render.
     pub telemetry: RenderTelemetry,
+    /// Whether the master limiter shaped these samples. Without it they are
+    /// the plain sum of every line and may stand above full scale.
+    pub limited: bool,
+}
+
+impl RenderedPiece {
+    /// The loudest sample in hand, as a linear level.
+    ///
+    /// Read off the samples rather than the telemetry, which describes the
+    /// render as made: after [`RenderedPiece::trim_start`] the two differ.
+    pub fn peak(&self) -> f32 {
+        self.samples
+            .iter()
+            .fold(0.0f32, |loudest, sample| loudest.max(sample.abs()))
+    }
+
+    /// Drop the first `frames` frames, so the render starts there.
+    ///
+    /// For keeping one pass of a section rendered several times over: cut at
+    /// [`occurrence_start_frame`], the first frame of the kept pass already
+    /// carries whatever the pass before it left ringing, which is what a loop
+    /// played back to back sounds like. The arrangement length shrinks by what
+    /// was dropped; the counts and telemetry still describe the render as made.
+    pub fn trim_start(&mut self, frames: u64) {
+        let samples = (frames as usize * 2).min(self.samples.len());
+        self.samples.drain(..samples);
+        let dropped = (samples / 2) as f64 / f64::from(self.sample_rate);
+        self.seconds = (self.seconds - dropped).max(0.0);
+        self.rendered_seconds = (self.samples.len() / 2) as f64 / f64::from(self.sample_rate);
+    }
+}
+
+/// The frame the `index`th occurrence of the timeline starts on.
+///
+/// Counted with the renderer's own arithmetic — whole frames per cycle, summed
+/// occurrence by occurrence — so cutting a render here lands on the sample the
+/// occurrence was scheduled from, not one rounded from seconds.
+pub fn occurrence_start_frame(piece: &Piece, index: usize, sample_rate: u32) -> u64 {
+    piece
+        .timeline
+        .iter()
+        .take(index)
+        .map(|occurrence| {
+            let section = &piece.sections[occurrence.section];
+            section_cycle_frames(section, sample_rate) * u64::from(section.cycles)
+        })
+        .sum()
 }
 
 /// Evidence about the work and headroom of an offline render.
@@ -148,6 +195,29 @@ pub enum Progress {
     Done { frames: u64 },
 }
 
+/// How a render is made, beyond the piece and its instruments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// Pass the mix through the master limiter. On by default: a piece is
+    /// rendered to be listened to, and the ceiling is what keeps it from
+    /// clipping.
+    ///
+    /// Off is for renders that are mixed again downstream — a piece cut into
+    /// per-instrument renders that a game sums and limits itself. A limiter
+    /// is not linear: each part limited on its own is pulled down by its own
+    /// peaks rather than by the mix's, so the parts would no longer add up to
+    /// the piece. Unlimited, they do.
+    pub master_limiter: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        RenderOptions {
+            master_limiter: true,
+        }
+    }
+}
+
 /// Render a piece, reporting progress as it goes.
 ///
 /// The plain [`render`] is this with the reports thrown away.
@@ -157,7 +227,24 @@ pub fn render_with_progress(
     sample_rate: u32,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<RenderedPiece, String> {
-    render_inner(piece, registry, sample_rate, progress)
+    render_inner(
+        piece,
+        registry,
+        sample_rate,
+        RenderOptions::default(),
+        progress,
+    )
+}
+
+/// [`render_with_progress`], made the way `options` says.
+pub fn render_with_options(
+    piece: &Piece,
+    registry: &InstrumentRegistry,
+    sample_rate: u32,
+    options: RenderOptions,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<RenderedPiece, String> {
+    render_inner(piece, registry, sample_rate, options, progress)
 }
 
 /// `registry` supplies the instruments — the built-ins plus whatever the
@@ -169,13 +256,20 @@ pub fn render(
     registry: &InstrumentRegistry,
     sample_rate: u32,
 ) -> Result<RenderedPiece, String> {
-    render_inner(piece, registry, sample_rate, &mut |_| {})
+    render_inner(
+        piece,
+        registry,
+        sample_rate,
+        RenderOptions::default(),
+        &mut |_| {},
+    )
 }
 
 fn render_inner(
     piece: &Piece,
     registry: &InstrumentRegistry,
     sample_rate: u32,
+    options: RenderOptions,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<RenderedPiece, String> {
     if piece.timeline.is_empty() {
@@ -305,7 +399,8 @@ fn render_inner(
         rayon::current_num_threads().min(island_count)
     };
     let rendered = render_islands(islands, total_frames, progress)?;
-    let (samples, master) = mix_and_limit(rendered, total_frames, sample_rate);
+    let (samples, master) =
+        mix_and_limit(rendered, total_frames, sample_rate, options.master_limiter);
     progress(Progress::Done {
         frames: total_frames,
     });
@@ -327,6 +422,7 @@ fn render_inner(
             max_gain_reduction_db: master.max_gain_reduction_db,
             limited_samples: master.limited_samples,
         },
+        limited: options.master_limiter,
     })
 }
 
@@ -465,6 +561,7 @@ fn mix_and_limit(
     islands: Vec<IslandAudio>,
     total_frames: u64,
     sample_rate: u32,
+    limit: bool,
 ) -> (Vec<f32>, SinkTelemetry) {
     let mut mixed = vec![0.0f32; total_frames as usize * 2];
     // `islands` is in declaration order even though workers finish in another
@@ -482,6 +579,12 @@ fn mix_and_limit(
     }
 
     let mut sink = AudioOutputSink::new(sample_rate as f32);
+    // Unlimited, the master still runs, so the telemetry is measured the same
+    // way; its ceiling is just out of reach, as each island's always is. The
+    // samples leave at unity gain and pre- and post-limiter peaks agree.
+    if !limit {
+        sink.set_parameter("limiter_threshold", f32::MAX);
+    }
     let mut telemetry = SinkTelemetry::default();
     for chunk in mixed.chunks_mut(512 * 2) {
         let block: Block = chunk
@@ -793,6 +896,107 @@ mod tests {
         );
     }
 
+    /// A section rendered on its own sounds the way it does in the song: its
+    /// drops and choices count from where the arrangement first plays it, not
+    /// from cycle 0, so the notes are the song's, shifted to the start. Its
+    /// alternations count from its own first bar either way (§8.6).
+    #[test]
+    fn an_isolated_section_schedules_the_songs_notes() {
+        let source = "bpm 120\ntail 0\n\
+             section intro 3 {\n  k kick \"x\"\n}\n\
+             section verse 4 {\n  lead sine \"[c4|e4|g4|b4] d5? [a3|f3] g5?\"\n\
+             \x20 chords sine \"<c3 e3 g3 a3>\"\n}\n\
+             arrange intro verse\n";
+        let (program, errors) = crate::parser::parse_program(source);
+        assert!(errors.is_empty(), "parse: {errors:?}");
+        let (piece, errors) = crate::piece::resolve(&program, (120, (4, 4), None));
+        assert!(errors.is_empty(), "resolve: {errors:?}");
+        let registry = InstrumentRegistry::built_in();
+        let verse = piece.section_index("verse").expect("verse");
+
+        let offset = 3 * section_cycle_frames(&piece.sections[0], 44_100);
+        let in_song: Vec<(u64, u8)> = scheduled_notes(&piece, &registry, 44_100)
+            .expect("notes")
+            .into_iter()
+            .filter(|note| note.section == "verse")
+            .map(|note| (note.start - offset, note.midi))
+            .collect();
+        let alone: Vec<(u64, u8)> = scheduled_notes(&piece.isolate(verse, 1), &registry, 44_100)
+            .expect("notes")
+            .into_iter()
+            .map(|note| (note.start, note.midi))
+            .collect();
+        assert!(!alone.is_empty());
+        assert_eq!(alone, in_song);
+
+        // The same section from cycle 0 is a different take — which is the
+        // whole reason the occurrence keeps its place.
+        let mut from_zero = piece.isolate(verse, 1);
+        from_zero.timeline[0].start_cycle = 0;
+        let fresh: Vec<(u64, u8)> = scheduled_notes(&from_zero, &registry, 44_100)
+            .expect("notes")
+            .into_iter()
+            .map(|note| (note.start, note.midi))
+            .collect();
+        assert_ne!(fresh, in_song, "the choices did not depend on the cycle");
+    }
+
+    /// Two passes render two sections' worth plus the tail; trimming at the
+    /// second pass leaves exactly one pass plus the tail, and those samples
+    /// are the render's own, not a re-render.
+    #[test]
+    fn the_last_pass_is_cut_on_the_frame_it_was_scheduled_from() {
+        // 100 bpm makes a cycle 2.4 s, 105_840 frames: a cut computed from
+        // seconds would have to round, the renderer's own count does not.
+        let source = "bpm 100\ntail 0.5\n\
+             section intro 1 {\n  k kick \"x\"\n}\n\
+             section verse 2 {\n  pad pad \"[c3,e3,g3]\"\n  hat hihat \"x*4\"\n}\n\
+             arrange intro verse\n";
+        let (program, errors) = crate::parser::parse_program(source);
+        assert!(errors.is_empty(), "parse: {errors:?}");
+        let (piece, errors) = crate::piece::resolve(&program, (120, (4, 4), None));
+        assert!(errors.is_empty(), "resolve: {errors:?}");
+        let verse = piece.section_index("verse").expect("verse");
+        let section = &piece.sections[verse];
+        let pass_frames = section_cycle_frames(section, 44_100) * u64::from(section.cycles);
+        let tail_frames = (0.5f64 * 44_100.0).round() as u64;
+
+        let twice = piece.isolate(verse, 2);
+        assert!((twice.seconds() - 2.0 * section.seconds()).abs() < 1e-9);
+        let mut rendered = render(&twice, &InstrumentRegistry::built_in(), 44_100).expect("render");
+        assert_eq!(
+            rendered.samples.len() as u64,
+            (2 * pass_frames + tail_frames) * 2
+        );
+        let whole = rendered.samples.clone();
+
+        let cut = occurrence_start_frame(&twice, 1, 44_100);
+        assert_eq!(cut, pass_frames);
+        rendered.trim_start(cut);
+        assert_eq!(
+            rendered.samples.len() as u64,
+            (pass_frames + tail_frames) * 2
+        );
+        assert_eq!(rendered.samples[..], whole[cut as usize * 2..]);
+        assert!((rendered.seconds - section.seconds()).abs() < 1e-6);
+
+        // Nothing here is generative, so the kept pass differs from a lone
+        // pass only by what the first one left ringing into it.
+        let once = render(
+            &piece.isolate(verse, 1),
+            &InstrumentRegistry::built_in(),
+            44_100,
+        )
+        .expect("render");
+        assert_eq!(once.samples.len(), rendered.samples.len());
+        let opening = 4_410 * 2;
+        let carried = rendered.samples[..opening]
+            .iter()
+            .zip(&once.samples[..opening])
+            .fold(0.0f32, |most, (a, b)| most.max((a - b).abs()));
+        assert!(carried > 1e-4, "the first pass left nothing ringing");
+    }
+
     #[test]
     fn the_arrangement_orders_what_is_heard() {
         let piece = rendered(
@@ -854,6 +1058,72 @@ mod tests {
         assert!(piece.telemetry.pre_limiter_peak >= piece.telemetry.post_limiter_peak);
         assert!(piece.telemetry.max_gain_reduction_db > 0.0);
         assert!(piece.telemetry.limited_samples > 0);
+    }
+
+    /// Rendered without the master limiter, a piece cut into per-instrument
+    /// renders adds back up to the whole — which, limited, it does not.
+    #[test]
+    fn unlimited_parts_sum_to_the_unlimited_mix() {
+        let source = "bpm 120\ntail 0.5\nsection dense 2 {\n\
+             \x20 k kick \"x*4\"\n  s snare \"x*4\"\n  h hihat \"x*8\"\n\
+             \x20 p pad \"[c3,e3,g3]\"\n  b bass \"c2*4\"\n}\n";
+        let (program, errors) = crate::parser::parse_program(source);
+        assert!(errors.is_empty(), "parse: {errors:?}");
+        let (piece, errors) = crate::piece::resolve(&program, (120, (4, 4), None));
+        assert!(errors.is_empty(), "resolve: {errors:?}");
+        let registry = InstrumentRegistry::built_in();
+        let make = |piece: &Piece, master_limiter: bool| {
+            render_with_options(
+                piece,
+                &registry,
+                44_100,
+                RenderOptions { master_limiter },
+                &mut |_| {},
+            )
+            .expect("render")
+        };
+
+        let mix = make(&piece, false);
+        assert!(!mix.limited);
+        assert!(mix.peak() > 1.0, "too quiet to tell: {}", mix.peak());
+        assert_eq!(mix.telemetry.limited_samples, 0);
+        assert_eq!(
+            mix.telemetry.pre_limiter_peak,
+            mix.telemetry.post_limiter_peak
+        );
+        assert_eq!(mix.telemetry.post_limiter_peak, mix.peak());
+
+        let parts = [vec!["kick", "snare", "hihat"], vec!["pad"], vec!["bass"]];
+        let sum_of = |limited: bool| {
+            let mut sum = vec![0.0f32; mix.samples.len()];
+            for keep in &parts {
+                let mut part = piece.clone();
+                part.mute_except(keep);
+                for (total, sample) in sum.iter_mut().zip(make(&part, limited).samples) {
+                    *total += sample;
+                }
+            }
+            sum
+        };
+        let error = |sum: &[f32]| {
+            sum.iter()
+                .zip(&mix.samples)
+                .fold(0.0f32, |worst, (a, b)| worst.max((a - b).abs()))
+        };
+        let unlimited = error(&sum_of(false));
+        assert!(
+            unlimited < 1e-4,
+            "the parts drift from the mix by {unlimited}"
+        );
+        // Limited, the full render is squeezed by the mix's peaks and each
+        // part only by its own, so the parts no longer add up to it.
+        let limited_mix = make(&piece, true);
+        assert!(limited_mix.limited && limited_mix.telemetry.limited_samples > 0);
+        let to_limited = sum_of(true)
+            .iter()
+            .zip(&limited_mix.samples)
+            .fold(0.0f32, |worst, (a, b)| worst.max((a - b).abs()));
+        assert!(to_limited > 0.05, "the limited parts summed anyway");
     }
 
     #[test]
@@ -1033,12 +1303,12 @@ pub fn section_strikes(
 }
 
 /// The absolute cycle a section first starts on, or 0 when it never plays.
+///
+/// The rule lives on [`Piece::first_playing`], so a caller without the
+/// renderer can read it too; this is kept beside [`section_strikes`], which
+/// it serves.
 pub fn first_playing(piece: &Piece, section: usize) -> u64 {
-    piece
-        .timeline
-        .iter()
-        .find(|occurrence| occurrence.section == section)
-        .map_or(0, |occurrence| occurrence.start_cycle)
+    piece.first_playing(section)
 }
 
 /// One line's strikes over its section, each with the 0-based cycle within
