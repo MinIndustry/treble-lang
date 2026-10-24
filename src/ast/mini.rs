@@ -55,6 +55,10 @@ pub struct Step {
     /// On a group or an alternation this is the velocity of everything the step
     /// sounds, except where an inner step names its own.
     pub velocity: Option<Ramp<f64>>,
+    /// Where the step was written — atom, modifiers and velocity — as a byte
+    /// range in the notation string between the quotes. An editor uses it to
+    /// point from a sounding note back to the text that made it.
+    pub source: Source,
 }
 
 impl Step {
@@ -64,7 +68,27 @@ impl Step {
             atom,
             modifiers: Vec::new(),
             velocity: None,
+            source: Source::default(),
         }
+    }
+}
+
+/// A byte range in a notation string, end exclusive.
+///
+/// Positions are not part of what a step means, so every `Source` compares
+/// equal to every other. Two notations that differ only in spacing are the same
+/// line: a test can write its expected AST without counting columns, and a
+/// session does not mistake a re-indented line for an edited one and restart
+/// its ramps.
+#[derive(Debug, Clone, Copy, Default, Eq)]
+pub struct Source {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl PartialEq for Source {
+    fn eq(&self, _: &Self) -> bool {
+        true
     }
 }
 

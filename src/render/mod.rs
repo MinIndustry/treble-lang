@@ -12,6 +12,6 @@ pub mod wav;
 
 pub use compile::PatternGate;
 pub use offline::{
-    Progress, RenderTelemetry, RenderedPiece, ScheduledNote, render, render_with_progress,
-    scheduled_notes,
+    Automation, LineStrikes, Progress, RenderTelemetry, RenderedPiece, ScheduledNote,
+    first_playing, render, render_with_progress, scheduled_notes, section_strikes,
 };

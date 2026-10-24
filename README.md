@@ -77,6 +77,25 @@ meta comment  "One collection, three centres."
 The key set is open. Well-known keys map to their standard tags; anything else
 is filed alongside the comment rather than dropped.
 
+## The language server
+
+```
+cargo install --path . --features serve
+treble serve
+```
+
+`serve` speaks LSP on stdin and stdout for an editor: diagnostics (the same
+checks as `check`, plus unknown instruments), completion, hover and
+go-to-definition on instrument names, and document symbols. On top of LSP it
+answers `treble/outline` and `treble/timeline` — the notes of chosen lines as
+the renderer schedules them, each pointing back at the step that wrote it —
+and plays through the default sound card with `treble/play` and
+`treble/stop`. Playback renders the asked-for lines of one section, placed
+where the piece first plays it, so a line heard alone sounds as it does in the
+render; an edit to a playing piece is re-rendered and swapped in at the next
+cycle. The protocol is written down in Quill's `PROTOCOL.md`, the editor it
+was built for.
+
 ## An example piece
 
 `pieces/nocturne.rt` is a complete five-and-a-half-minute piece — ten sections,
