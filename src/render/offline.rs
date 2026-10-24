@@ -65,9 +65,22 @@ pub struct RenderedPiece {
     pub unused: Vec<String>,
     /// Runtime and master-bus measurements from this render.
     pub telemetry: RenderTelemetry,
+    /// Whether the master limiter shaped these samples. Without it they are
+    /// the plain sum of every line and may stand above full scale.
+    pub limited: bool,
 }
 
 impl RenderedPiece {
+    /// The loudest sample in hand, as a linear level.
+    ///
+    /// Read off the samples rather than the telemetry, which describes the
+    /// render as made: after [`RenderedPiece::trim_start`] the two differ.
+    pub fn peak(&self) -> f32 {
+        self.samples
+            .iter()
+            .fold(0.0f32, |loudest, sample| loudest.max(sample.abs()))
+    }
+
     /// Drop the first `frames` frames, so the render starts there.
     ///
     /// For keeping one pass of a section rendered several times over: cut at
@@ -182,6 +195,29 @@ pub enum Progress {
     Done { frames: u64 },
 }
 
+/// How a render is made, beyond the piece and its instruments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// Pass the mix through the master limiter. On by default: a piece is
+    /// rendered to be listened to, and the ceiling is what keeps it from
+    /// clipping.
+    ///
+    /// Off is for renders that are mixed again downstream — a piece cut into
+    /// per-instrument renders that a game sums and limits itself. A limiter
+    /// is not linear: each part limited on its own is pulled down by its own
+    /// peaks rather than by the mix's, so the parts would no longer add up to
+    /// the piece. Unlimited, they do.
+    pub master_limiter: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        RenderOptions {
+            master_limiter: true,
+        }
+    }
+}
+
 /// Render a piece, reporting progress as it goes.
 ///
 /// The plain [`render`] is this with the reports thrown away.
@@ -191,7 +227,24 @@ pub fn render_with_progress(
     sample_rate: u32,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<RenderedPiece, String> {
-    render_inner(piece, registry, sample_rate, progress)
+    render_inner(
+        piece,
+        registry,
+        sample_rate,
+        RenderOptions::default(),
+        progress,
+    )
+}
+
+/// [`render_with_progress`], made the way `options` says.
+pub fn render_with_options(
+    piece: &Piece,
+    registry: &InstrumentRegistry,
+    sample_rate: u32,
+    options: RenderOptions,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<RenderedPiece, String> {
+    render_inner(piece, registry, sample_rate, options, progress)
 }
 
 /// `registry` supplies the instruments — the built-ins plus whatever the
@@ -203,13 +256,20 @@ pub fn render(
     registry: &InstrumentRegistry,
     sample_rate: u32,
 ) -> Result<RenderedPiece, String> {
-    render_inner(piece, registry, sample_rate, &mut |_| {})
+    render_inner(
+        piece,
+        registry,
+        sample_rate,
+        RenderOptions::default(),
+        &mut |_| {},
+    )
 }
 
 fn render_inner(
     piece: &Piece,
     registry: &InstrumentRegistry,
     sample_rate: u32,
+    options: RenderOptions,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<RenderedPiece, String> {
     if piece.timeline.is_empty() {
@@ -339,7 +399,8 @@ fn render_inner(
         rayon::current_num_threads().min(island_count)
     };
     let rendered = render_islands(islands, total_frames, progress)?;
-    let (samples, master) = mix_and_limit(rendered, total_frames, sample_rate);
+    let (samples, master) =
+        mix_and_limit(rendered, total_frames, sample_rate, options.master_limiter);
     progress(Progress::Done {
         frames: total_frames,
     });
@@ -361,6 +422,7 @@ fn render_inner(
             max_gain_reduction_db: master.max_gain_reduction_db,
             limited_samples: master.limited_samples,
         },
+        limited: options.master_limiter,
     })
 }
 
@@ -499,6 +561,7 @@ fn mix_and_limit(
     islands: Vec<IslandAudio>,
     total_frames: u64,
     sample_rate: u32,
+    limit: bool,
 ) -> (Vec<f32>, SinkTelemetry) {
     let mut mixed = vec![0.0f32; total_frames as usize * 2];
     // `islands` is in declaration order even though workers finish in another
@@ -516,6 +579,12 @@ fn mix_and_limit(
     }
 
     let mut sink = AudioOutputSink::new(sample_rate as f32);
+    // Unlimited, the master still runs, so the telemetry is measured the same
+    // way; its ceiling is just out of reach, as each island's always is. The
+    // samples leave at unity gain and pre- and post-limiter peaks agree.
+    if !limit {
+        sink.set_parameter("limiter_threshold", f32::MAX);
+    }
     let mut telemetry = SinkTelemetry::default();
     for chunk in mixed.chunks_mut(512 * 2) {
         let block: Block = chunk
@@ -989,6 +1058,72 @@ mod tests {
         assert!(piece.telemetry.pre_limiter_peak >= piece.telemetry.post_limiter_peak);
         assert!(piece.telemetry.max_gain_reduction_db > 0.0);
         assert!(piece.telemetry.limited_samples > 0);
+    }
+
+    /// Rendered without the master limiter, a piece cut into per-instrument
+    /// renders adds back up to the whole — which, limited, it does not.
+    #[test]
+    fn unlimited_parts_sum_to_the_unlimited_mix() {
+        let source = "bpm 120\ntail 0.5\nsection dense 2 {\n\
+             \x20 k kick \"x*4\"\n  s snare \"x*4\"\n  h hihat \"x*8\"\n\
+             \x20 p pad \"[c3,e3,g3]\"\n  b bass \"c2*4\"\n}\n";
+        let (program, errors) = crate::parser::parse_program(source);
+        assert!(errors.is_empty(), "parse: {errors:?}");
+        let (piece, errors) = crate::piece::resolve(&program, (120, (4, 4), None));
+        assert!(errors.is_empty(), "resolve: {errors:?}");
+        let registry = InstrumentRegistry::built_in();
+        let make = |piece: &Piece, master_limiter: bool| {
+            render_with_options(
+                piece,
+                &registry,
+                44_100,
+                RenderOptions { master_limiter },
+                &mut |_| {},
+            )
+            .expect("render")
+        };
+
+        let mix = make(&piece, false);
+        assert!(!mix.limited);
+        assert!(mix.peak() > 1.0, "too quiet to tell: {}", mix.peak());
+        assert_eq!(mix.telemetry.limited_samples, 0);
+        assert_eq!(
+            mix.telemetry.pre_limiter_peak,
+            mix.telemetry.post_limiter_peak
+        );
+        assert_eq!(mix.telemetry.post_limiter_peak, mix.peak());
+
+        let parts = [vec!["kick", "snare", "hihat"], vec!["pad"], vec!["bass"]];
+        let sum_of = |limited: bool| {
+            let mut sum = vec![0.0f32; mix.samples.len()];
+            for keep in &parts {
+                let mut part = piece.clone();
+                part.mute_except(keep);
+                for (total, sample) in sum.iter_mut().zip(make(&part, limited).samples) {
+                    *total += sample;
+                }
+            }
+            sum
+        };
+        let error = |sum: &[f32]| {
+            sum.iter()
+                .zip(&mix.samples)
+                .fold(0.0f32, |worst, (a, b)| worst.max((a - b).abs()))
+        };
+        let unlimited = error(&sum_of(false));
+        assert!(
+            unlimited < 1e-4,
+            "the parts drift from the mix by {unlimited}"
+        );
+        // Limited, the full render is squeezed by the mix's peaks and each
+        // part only by its own, so the parts no longer add up to it.
+        let limited_mix = make(&piece, true);
+        assert!(limited_mix.limited && limited_mix.telemetry.limited_samples > 0);
+        let to_limited = sum_of(true)
+            .iter()
+            .zip(&limited_mix.samples)
+            .fold(0.0f32, |worst, (a, b)| worst.max((a - b).abs()));
+        assert!(to_limited > 0.05, "the limited parts summed anyway");
     }
 
     #[test]

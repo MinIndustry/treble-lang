@@ -36,6 +36,9 @@ RENDER OPTIONS:
                          piece's own `tail` (§8.7).
         --only <a,b>     Mute every line whose instrument is not listed. An
                          instrument no rendered line plays is an error.
+        --no-limit       Skip the master limiter, so renders of parts add up
+                         to the render of the whole. Peaks may pass 1.0; the
+                         WAV is 32-bit float, so they are kept, not clipped.
     -f, --force          Overwrite the output if it exists.
     -q, --quiet          Only report errors.
         --json           Emit a machine-readable summary on stdout.
@@ -326,7 +329,9 @@ fn cmd_render(_args: &[String]) -> Result<(), String> {
 fn cmd_render(args: &[String]) -> Result<(), String> {
     use std::io::Write;
     use std::path::PathBuf;
-    use treble_lang::render::{Progress, occurrence_start_frame, render_with_progress, wav};
+    use treble_lang::render::{
+        Progress, RenderOptions, occurrence_start_frame, render_with_options, wav,
+    };
 
     let mut input: Option<String> = None;
     let mut out: Option<PathBuf> = None;
@@ -336,6 +341,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     let mut passes: u32 = 1;
     let mut only: Vec<String> = Vec::new();
     let mut tail: Option<f64> = None;
+    let mut limit = true;
     let (mut force, mut quiet, mut json) = (false, false, false);
 
     let mut i = 0;
@@ -397,6 +403,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                     return Err("--only: expected one or more instruments".into());
                 }
             }
+            "--no-limit" => limit = false,
             "-f" | "--force" => force = true,
             "-q" | "--quiet" => quiet = true,
             "--json" => json = true,
@@ -515,7 +522,10 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         }
     };
 
-    let mut rendered = render_with_progress(&piece, &registry, rate, &mut report)?;
+    let options = RenderOptions {
+        master_limiter: limit,
+    };
+    let mut rendered = render_with_options(&piece, &registry, rate, options, &mut report)?;
     if !quiet {
         eprint!("\r\x1b[2K");
     }
@@ -541,7 +551,8 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
             "{{\"path\":{:?},\"section\":{},\"passes\":{},\"seconds\":{:.3},\"renderedSeconds\":{:.3},\"sampleRate\":{},\
              \"sections\":{},\"occurrences\":{},\"cycles\":{},\"notes\":{},\"elapsed\":{:.3},\
              \"islands\":{},\"slots\":{},\"workers\":{},\"preLimiterPeak\":{:.6},\
-             \"postLimiterPeak\":{:.6},\"maxGainReductionDb\":{:.3},\"limitedSamples\":{}}}",
+             \"postLimiterPeak\":{:.6},\"maxGainReductionDb\":{:.3},\"limitedSamples\":{},\
+             \"limited\":{},\"peak\":{:.6}}}",
             out.display().to_string(),
             section
                 .as_ref()
@@ -561,7 +572,9 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
             rendered.telemetry.pre_limiter_peak,
             rendered.telemetry.post_limiter_peak,
             rendered.telemetry.max_gain_reduction_db,
-            rendered.telemetry.limited_samples
+            rendered.telemetry.limited_samples,
+            rendered.limited,
+            rendered.peak()
         );
     } else if !quiet {
         eprintln!(
@@ -580,6 +593,13 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                 rendered.telemetry.post_limiter_peak,
                 rendered.telemetry.max_gain_reduction_db,
                 rendered.telemetry.limited_samples
+            );
+        }
+        if !rendered.limited && rendered.peak() > 1.0 {
+            eprintln!(
+                "  note: unlimited, peaks at {:.3} — kept in the float WAV, but mix it \
+                 down before converting it to integer PCM",
+                rendered.peak()
             );
         }
         for name in &rendered.unused {
