@@ -35,7 +35,8 @@ treble-lang = { …, features = ["render"] }
   specs, `fx` names resolved against the engine's registry. Shared with the
   live front end, so a rendered piece and a played performance compile through
   the same code.
-- `render::offline` — drives that output through the engine to samples.
+- `render::offline` — drives that output through the engine to samples,
+  through a master limiter unless `RenderOptions` turns it off.
 - `render::wav` — writes the result, metadata and all.
 
 ## The command line
@@ -45,6 +46,7 @@ cargo install --path . --features render
 
 treble check  piece.rt      # parse, report errors, exit 1 on any
 treble info   piece.rt      # sections, arrangement, spans, metadata
+treble info   piece.rt --json            # the same, for a script
 treble render piece.rt      # → piece.wav
 ```
 
@@ -61,7 +63,42 @@ Progress is reported on stderr and the summary on stdout, so `--json` composes:
 
 ```
 treble render piece.rt --json | jq .renderedSeconds
+treble info   piece.rt --json | jq '.sections[] | {name, seconds, firstCycle}'
 ```
+
+`info --json` gives the metadata, `tail`, `seed`, the arrangement and timeline,
+and for each section its cycles, tempo, signature, length, the cycle it first
+plays on, how often it plays, and its lines with their instrument, group, mute
+and span. `--bars` (needs `render`) adds, per line, which bars it strikes on.
+
+### Rendering parts of a piece
+
+`render` can cut a piece up without touching its source — for a game that plays
+a song back as per-section, per-instrument loops, say:
+
+```
+treble render piece.rt --section verse --passes 2 --only bass,sub --no-limit -o verse-bass.wav
+```
+
+- `-s/--section <name>` renders one section, **starting on the cycle the
+  arrangement first plays it on**. Random choices, drops and solos count from
+  a section's place in the piece, so a section rendered as a fresh piece would
+  be a different take from the one in the song.
+- `-p/--passes <n>` plays the section n times back to back and keeps only the
+  last pass and its tail, cut on the exact frame it starts on. The file then
+  opens on the reverb and delay the previous pass left ringing, which is what a
+  loop sounds like when it follows itself. How much carries in is the tail, so
+  `--tail 0` carries nothing.
+- `--only <instrument>[,…]` mutes every line whose instrument is not listed;
+  what is left sounds exactly as it does in the mix, buses and all. An
+  instrument that no line of the rendered section plays is an error, so a typo
+  fails rather than writing silence.
+- `-t/--tail <seconds>` overrides the piece's `tail`.
+- `--no-limit` skips the master limiter. Limited renders of parts do not add
+  up to the limited whole; unlimited ones do, so leave the limiting to whatever
+  mixes them. The WAV is 32-bit float and peaks above 1.0 are kept, not
+  clipped — convert to integer PCM only after mixing. `--json` reports
+  `limited` and the `peak` of the samples written.
 
 ### Metadata
 
