@@ -133,6 +133,103 @@ impl Piece {
         self.seconds() + self.tail
     }
 
+    /// The index into [`Piece::sections`] of the section called `name`.
+    pub fn section_index(&self, name: &str) -> Option<usize> {
+        self.sections
+            .iter()
+            .position(|section| section.name == name)
+    }
+
+    /// The absolute cycle a section first starts on, or 0 when it never plays.
+    ///
+    /// This is where a section is taken from whenever it is looked at on its
+    /// own — drawn by an editor or rendered by itself — because its generative
+    /// steps count from there.
+    pub fn first_playing(&self, section: usize) -> u64 {
+        self.timeline
+            .iter()
+            .find(|occurrence| occurrence.section == section)
+            .map_or(0, |occurrence| occurrence.start_cycle)
+    }
+
+    /// This piece cut down to one section, heard where the song first plays it
+    /// and then `passes` times back to back.
+    ///
+    /// The first occurrence keeps the section's absolute starting cycle rather
+    /// than starting from 0: choices, drops and solos count from an
+    /// occurrence's place in the piece (§3.12, §3.15, §3.19, §8.8), so a
+    /// section rendered as a fresh piece would not sound the way it does in
+    /// the song. The rule is the editor's — a section never played is taken
+    /// from cycle 0. Each further pass follows on the next cycle, exactly as
+    /// `arrange <section>*<passes>` would place it. `passes` below 1 is taken
+    /// as 1.
+    ///
+    /// Lines outside every section still sound under it, as they do in the
+    /// song, and the metadata travels so a render of the part is still filed
+    /// under the piece. Every other section is dropped, so nothing is reported
+    /// as never played.
+    pub fn isolate(&self, section: usize, passes: u32) -> Piece {
+        let kept = self.sections[section].clone();
+        let passes = passes.max(1);
+        let origin = self.first_playing(section);
+        Piece {
+            arrangement: vec![ArrangeItem {
+                section: kept.name.clone(),
+                repeat: passes,
+            }],
+            timeline: (0..passes)
+                .map(|pass| Occurrence {
+                    section: 0,
+                    start_cycle: origin + u64::from(pass) * u64::from(kept.cycles),
+                })
+                .collect(),
+            sections: vec![kept],
+            throughout: self.throughout.clone(),
+            tail: self.tail,
+            seed: self.seed,
+            unused: Vec::new(),
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    /// Every instrument a line plays in the sections the arrangement plays,
+    /// or throughout them, sorted and without repeats. Muted lines count: the
+    /// instrument is written there, whether or not it sounds.
+    pub fn played_instruments(&self) -> Vec<&str> {
+        let mut played: Vec<usize> = self.timeline.iter().map(|o| o.section).collect();
+        played.sort_unstable();
+        played.dedup();
+        let mut instruments: Vec<&str> = played
+            .into_iter()
+            .flat_map(|index| &self.sections[index].patterns)
+            .chain(&self.throughout)
+            .map(|line| line.instrument.as_str())
+            .collect();
+        instruments.sort_unstable();
+        instruments.dedup();
+        instruments
+    }
+
+    /// Mute every line — in a section, in a group or throughout — whose
+    /// instrument is not one of `keep`.
+    ///
+    /// The piece keeps its length, its timing and every line's place, so what
+    /// is left sounds exactly as it does in the full mix; only the other
+    /// instruments fall silent. Groups keep their buses, so a kept line still
+    /// goes through its group's filters (§7).
+    pub fn mute_except(&mut self, keep: &[&str]) {
+        for line in self
+            .sections
+            .iter_mut()
+            .flat_map(|section| section.patterns.iter_mut())
+            .chain(self.throughout.iter_mut())
+        {
+            if !keep.contains(&line.instrument.as_str()) {
+                line.muted = true;
+            }
+        }
+    }
+
     /// Walk the timeline, yielding each occurrence with its section and the
     /// second it starts at.
     ///

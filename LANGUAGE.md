@@ -1325,7 +1325,7 @@ but the value takes effect at the next boundary like any other directive.
 
 ```
 meta title    "Nocturne for a Slow Machine"
-meta composer "F. Grimau"
+meta composer "Minigrim0"
 meta comment  "One collection, three centres."
 meta tuning   "twelve-tone equal"
 ```

@@ -612,3 +612,86 @@ fn metadata_is_inert_in_a_live_buffer() {
     // It changes no sound, so it produces no delta beyond the pattern itself.
     assert_eq!(result.deltas.len(), 1);
 }
+
+// --- Isolating a section ---
+
+#[test]
+fn an_isolated_section_starts_where_the_song_first_plays_it() {
+    let full = piece(
+        "bpm 120\nsection intro 2 {\n  a kick \"x\"\n}\n\
+         section verse 4 {\n  bpm 90\n  b kick \"x\"\n}\n\
+         drone sine \"c2\"\n\
+         arrange intro*3 verse intro verse\n",
+    );
+    let verse = full.section_index("verse").expect("verse");
+    assert_eq!(full.first_playing(verse), 6);
+
+    let alone = full.isolate(verse, 1);
+    assert_eq!(alone.sections.len(), 1);
+    assert_eq!(alone.sections[0].name, "verse");
+    assert_eq!(
+        alone.timeline,
+        vec![super::Occurrence {
+            section: 0,
+            start_cycle: 6
+        }]
+    );
+    assert_eq!(alone.total_cycles(), 4);
+    assert!((alone.seconds() - full.sections[verse].seconds()).abs() < 1e-9);
+    assert_eq!(
+        alone.throughout.len(),
+        1,
+        "a line outside sections still sounds"
+    );
+    assert!(alone.unused.is_empty(), "the dropped sections are not news");
+}
+
+#[test]
+fn a_section_never_played_is_isolated_from_cycle_0() {
+    let full = piece(
+        "section a 2 {\n  x kick \"x\"\n}\nsection sketch 2 {\n  y kick \"x\"\n}\narrange a a\n",
+    );
+    let sketch = full.section_index("sketch").expect("sketch");
+    assert_eq!(full.isolate(sketch, 1).timeline[0].start_cycle, 0);
+    assert_eq!(full.section_index("chorus"), None);
+}
+
+#[test]
+fn passes_follow_one_another_from_the_first_playing() {
+    let full = piece(
+        "bpm 120\nsection intro 2 {\n  a kick \"x\"\n}\n\
+         section verse 4 {\n  b kick \"x\"\n}\n\
+         arrange intro verse\n",
+    );
+    let verse = full.section_index("verse").expect("verse");
+    let three = full.isolate(verse, 3);
+    let starts: Vec<u64> = three.timeline.iter().map(|o| o.start_cycle).collect();
+    assert_eq!(starts, vec![2, 6, 10]);
+    assert_eq!(three.arrangement[0].repeat, 3);
+    assert!((three.seconds() - 3.0 * full.sections[verse].seconds()).abs() < 1e-9);
+    assert_eq!(full.isolate(verse, 0).timeline.len(), 1, "0 passes is one");
+}
+
+#[test]
+fn muting_all_but_some_instruments_keeps_grouped_lines_and_the_timing() {
+    let mut full = piece(
+        "bpm 120\nsection a 2 {\n  k kick \"x\"\n  group keys {\n    e epiano \"c4\"\n    \
+         p pad \"c3\"\n  } | reverb 0.3\n}\nhum sine \"c1\"\n",
+    );
+    assert_eq!(
+        full.played_instruments(),
+        vec!["epiano", "kick", "pad", "sine"]
+    );
+    let seconds = full.seconds();
+    full.mute_except(&["epiano"]);
+    let sounding: Vec<&str> = full.sections[0]
+        .patterns
+        .iter()
+        .chain(&full.throughout)
+        .filter(|line| !line.muted)
+        .map(|line| line.name.as_str())
+        .collect();
+    assert_eq!(sounding, vec!["e"]);
+    assert_eq!(full.sections[0].groups.len(), 1, "the bus stays");
+    assert_eq!(full.seconds(), seconds);
+}
