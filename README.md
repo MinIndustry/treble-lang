@@ -9,7 +9,7 @@ run the thing.
 ## The library
 
 ```toml
-treble-lang = { git = "https://github.com/MinIndustry/treble-lang.git", tag = "0.4.0" }
+treble-lang = "0.8.0"
 ```
 
 Parsing has no dependencies beyond `nom`. The engine is *not* pulled in: a tool
