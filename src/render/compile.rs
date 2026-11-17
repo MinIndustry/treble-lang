@@ -2140,7 +2140,8 @@ pub fn map_event_notes(event: &mut Event, map: impl Fn(u8) -> u8 + Copy) {
 
 pub fn arpeggiate(segments: &mut Vec<Segment>, mode: ArpMode) {
     let mut expanded = Vec::new();
-    for segment in segments.drain(..) {
+    for mut segment in segments.drain(..) {
+        arpeggiate_nested(&mut segment.event, mode);
         let Event::Notes(mut notes) = segment.event else {
             expanded.push(segment);
             continue;
@@ -2152,25 +2153,7 @@ pub fn arpeggiate(segments: &mut Vec<Segment>, mode: ArpMode) {
             });
             continue;
         }
-        notes.sort_unstable();
-        match mode {
-            ArpMode::Down => notes.reverse(),
-            ArpMode::UpDown => {
-                let tail: Vec<_> = notes
-                    .iter()
-                    .rev()
-                    .skip(1)
-                    .take(notes.len() - 2)
-                    .copied()
-                    .collect();
-                notes.extend(tail);
-            }
-            ArpMode::Random => {
-                let len = notes.len();
-                notes.rotate_left((segment.start * 1000.0) as usize % len);
-            }
-            ArpMode::Up => {}
-        }
+        order_arpeggio(&mut notes, mode, segment.start);
         let duration = (segment.end - segment.start) / notes.len() as f64;
         for (index, note) in notes.into_iter().enumerate() {
             expanded.push(Segment {
@@ -2185,6 +2168,64 @@ pub fn arpeggiate(segments: &mut Vec<Segment>, mode: ArpMode) {
         }
     }
     *segments = expanded;
+}
+
+// Alternations and choices retain their branches until the cycle is known.
+// Transform every branch now so selection, drops and source positions survive.
+fn arpeggiate_nested(event: &mut Event, mode: ArpMode) {
+    let (Event::Alternatives(options) | Event::Choice(options)) = event else {
+        return;
+    };
+    for option in options {
+        let mut expanded = Vec::new();
+        for mut timed in option.drain(..) {
+            arpeggiate_nested(&mut timed.event, mode);
+            let Event::Notes(mut notes) = timed.event else {
+                expanded.push(timed);
+                continue;
+            };
+            if notes.len() < 2 {
+                expanded.push(TimedEvent {
+                    event: Event::Notes(notes),
+                    ..timed
+                });
+                continue;
+            }
+            order_arpeggio(&mut notes, mode, timed.start);
+            let duration = (timed.end - timed.start) / notes.len() as f64;
+            for (index, note) in notes.into_iter().enumerate() {
+                expanded.push(TimedEvent {
+                    start: timed.start + duration * index as f64,
+                    end: timed.start + duration * (index + 1) as f64,
+                    event: Event::Notes(vec![note]),
+                    ..timed
+                });
+            }
+        }
+        *option = expanded;
+    }
+}
+
+fn order_arpeggio(notes: &mut Vec<u8>, mode: ArpMode, start: f64) {
+    notes.sort_unstable();
+    match mode {
+        ArpMode::Down => notes.reverse(),
+        ArpMode::UpDown => {
+            let tail: Vec<_> = notes
+                .iter()
+                .rev()
+                .skip(1)
+                .take(notes.len() - 2)
+                .copied()
+                .collect();
+            notes.extend(tail);
+        }
+        ArpMode::Random => {
+            let len = notes.len();
+            notes.rotate_left((start * 1000.0) as usize % len);
+        }
+        ArpMode::Up => {}
+    }
 }
 
 pub fn atom_event(atom: &Atom, scale: Option<(PitchRoot, ScaleMode)>) -> Event {
