@@ -821,6 +821,77 @@ mod tests {
         assert_eq!(written, vec![(1, "e3"), (1, "g3")]);
     }
 
+    #[test]
+    fn arpeggios_expand_chords_inside_alternations_and_choices() {
+        for notation in [
+            "<[g3,c3,e3]:0.4 [a3,d3,f3]:0.6>",
+            "[<[g3,c3,e3]:0.4 [a3,d3,f3]:0.6>|<[g3,c3,e3]:0.4 [a3,d3,f3]:0.6>]",
+            "<[[g3,c3,e3]:0.4 ~ ~ [g3,c3,e3]:0.4 ~ ~] [[a3,d3,f3]:0.6 ~ ~ [a3,d3,f3]:0.6 ~ ~]>",
+        ] {
+            for (mode, order) in [
+                ("up", vec![0, 1, 2]),
+                ("down", vec![2, 1, 0]),
+                ("updown", vec![0, 1, 2, 1]),
+                ("random", vec![0, 1, 2]),
+            ] {
+                let source = format!(
+                    "section a 2 {{\n band sine \"{notation}\" | oct -1 | arp {mode}\n}}\n"
+                );
+                let (program, errors) = crate::parser::parse_program(&source);
+                assert!(errors.is_empty(), "parse: {errors:?}");
+                let (piece, errors) = crate::piece::resolve(&program, (120, (4, 4), None));
+                assert!(errors.is_empty(), "resolve: {errors:?}");
+                let lanes = section_strikes(&piece, &InstrumentRegistry::built_in(), 0, None)
+                    .expect("strikes");
+                for cycle in 0..2 {
+                    let strikes: Vec<_> = lanes[0]
+                        .strikes
+                        .iter()
+                        .filter(|(bar, _)| *bar == cycle)
+                        .map(|(_, strike)| strike)
+                        .collect();
+                    let pitches = if cycle == 0 {
+                        [36, 40, 43]
+                    } else {
+                        [38, 41, 45]
+                    };
+                    assert!(strikes.len() >= order.len());
+                    assert_eq!(
+                        strikes[..order.len()]
+                            .iter()
+                            .map(|s| s.notes.clone())
+                            .collect::<Vec<_>>(),
+                        order.iter().map(|i| vec![pitches[*i]]).collect::<Vec<_>>(),
+                        "{notation}, {mode}"
+                    );
+                    for strike in &strikes {
+                        assert_eq!(strike.notes.len(), 1);
+                        assert!(
+                            (strike.velocity - if cycle == 0 { 0.4 } else { 0.6 }).abs() < 1e-6
+                        );
+                        assert!(
+                            notation[strike.source.start as usize..strike.source.end as usize]
+                                .starts_with('[')
+                        );
+                    }
+                    for pair in strikes.windows(2) {
+                        assert!(
+                            (pair[0].end - pair[1].start) <= 1e-9,
+                            "overlapping arpeggio notes"
+                        );
+                    }
+                    assert!((strikes[0].start - 0.0).abs() < 1e-9);
+                    let chord_end = if notation.contains("~") {
+                        1.0 / 6.0
+                    } else {
+                        1.0
+                    };
+                    assert!((strikes[order.len() - 1].end - chord_end).abs() < 1e-9);
+                }
+            }
+        }
+    }
+
     /// `ramp` counts from where the line comes in (§8.6): a line entering on
     /// bar 3 of a section starts its travel there, not two bars in.
     #[test]
