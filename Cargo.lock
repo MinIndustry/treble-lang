@@ -1678,9 +1678,9 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "treble"
-version = "0.4.3"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34de91aaf2e7d7c69881b6b79cfc4651af6bffd4fe8e0f173bbacd5ed7d9fbd9"
+checksum = "0521c38b9935a955f0d3d006eaad19ee570a2229f16483ee7b8bd0239b89b6ce"
 dependencies = [
  "atomic_float",
  "chrono",
@@ -1695,6 +1695,7 @@ dependencies = [
  "plotters",
  "rand",
  "serde",
+ "serde_json",
  "simplelog",
  "thiserror 2.0.20",
  "toml",
@@ -1705,11 +1706,12 @@ dependencies = [
 
 [[package]]
 name = "treble-derive"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aef642c297c775e655952084901ab703f7f707ae4fad6da59c94cfd3fa87c93f"
+checksum = "fe38cfdffc17d4f4c913a18c5ac84b3e62e6903c9c0ab0865cc815d137382a1a"
 dependencies = [
  "convert_case",
+ "proc-macro-crate",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -1718,7 +1720,7 @@ dependencies = [
 
 [[package]]
 name = "treble-lang"
-version = "0.8.0"
+version = "0.8.2"
 dependencies = [
  "cpal",
  "criterion",
@@ -1732,13 +1734,14 @@ dependencies = [
 
 [[package]]
 name = "treble-meta"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d4c5ae50588a53b88109f9089ac62189c276de46fa35b43fb1b4c7706432f01"
+checksum = "e3624d63709a7d16fde0bccee0250f035364a06ff66c91db6c98129afa720521"
 dependencies = [
  "proc-macro2",
  "quote",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
